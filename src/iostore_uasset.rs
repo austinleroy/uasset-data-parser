@@ -1,6 +1,6 @@
 use base64::{prelude::BASE64_STANDARD, Engine};
 use byteorder::{ReadBytesExt, WriteBytesExt, LE};
-use std::{error::Error, io::{BufRead, Cursor, Read, Seek, Write, SeekFrom}, iter};
+use std::{error::Error, fmt::Display, io::{BufRead, Cursor, Read, Seek, SeekFrom, Write}};
 
 struct UObjectSummaryHeader {
     name: u64,     
@@ -119,23 +119,25 @@ impl UObjectSummary {
 
         for name in &self.name_map {
             result.push(name.len() as u8);
-            result.write(name.as_bytes()).unwrap();
+            result.write_all(name.as_bytes()).unwrap();
             result.push(0);
         }
         
-        result.write(&self.remaining_bytes).unwrap();
+        result.write_all(&self.remaining_bytes).unwrap();
 
         result
-    }
-
-    pub fn to_string(&self) -> String {
-        BASE64_STANDARD.encode(self.to_bytes::<LE>())
     }
 
     pub fn from_string(str: &str) -> Result<Self, Box<dyn Error>> {
         let bytes = BASE64_STANDARD.decode(str).map_err(|_| "Unable to read object summary header from base64 string. This value shouldn't be manually edited.")?;
         let mut bytes = Cursor::new(bytes);
         Self::from_buffer::<_, LE>(&mut bytes)
+    }
+}
+
+impl Display for UObjectSummary {    
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&BASE64_STANDARD.encode(self.to_bytes::<LE>()))
     }
 }
 
@@ -147,7 +149,7 @@ pub struct UObjectProperty {
 }
 
 impl UObjectProperty {
-    pub fn from_buffer<R: Read + Seek, E: byteorder::ByteOrder>(mut reader: &mut R, name_map: &[String]) -> Result<Option<Self>, Box<dyn Error>> {
+    pub fn from_buffer<R: Read + Seek, E: byteorder::ByteOrder>(reader: &mut R, name_map: &[String]) -> Result<Option<Self>, Box<dyn Error>> {
         let name_index = reader.read_u64::<E>().unwrap() as usize;
         let name = name_map[name_index].clone();
 
@@ -161,7 +163,7 @@ impl UObjectProperty {
         let _data_size = reader.read_u32::<E>().unwrap() as usize;
         let arr_index = reader.read_u32::<E>().unwrap() as usize;
 
-        let data = UObjectPropertyData::from_buffer::<R,E>(&mut reader, &r#type, name_map)?;
+        let data = UObjectPropertyData::from_buffer::<R,E>(reader, &r#type, name_map)?;
         
         Ok(Some(Self {
             name,
@@ -171,26 +173,25 @@ impl UObjectProperty {
     }
 
     pub fn to_bytes<W: Write, E: byteorder::ByteOrder>(&self, writer: &mut W, name_map: &[String]) -> usize {
-        let name_index = name_map.iter().position(|n| n == &self.name).expect(&format!("Object type [{}] wasn't in name map", self.name)) as u64;
+        let name_index = name_map.iter().position(|n| n == &self.name).unwrap_or_else(|| panic!("Object type [{}] wasn't in name map", self.name)) as u64;
         if self.name == "None" {
             writer.write_u64::<E>(name_index).unwrap();
             std::mem::size_of::<u64>()
         } else {
             let r#type = match &self.data {
-                UObjectPropertyData::BoolProperty(_) => "BoolProperty",
-                UObjectPropertyData::ByteProperty(_,_) => "ByteProperty",
-                UObjectPropertyData::FloatProperty(_) => "FloatProperty",
-                UObjectPropertyData::IntProperty(_) => "IntProperty",
-                UObjectPropertyData::MapProperty(_, _, _) => "MapProperty",
-                UObjectPropertyData::StringProperty(_) => "StrProperty",
-                UObjectPropertyData::StructProperty(_) => "StructProperty",
-                UObjectPropertyData::UInt16Property(_) => "UInt16Property",
+                UObjectPropertyData::Bool(_) => "BoolProperty",
+                UObjectPropertyData::Byte(_,_) => "ByteProperty",
+                UObjectPropertyData::Float(_) => "FloatProperty",
+                UObjectPropertyData::Int(_) => "IntProperty",
+                UObjectPropertyData::Map(_, _, _) => "MapProperty",
+                UObjectPropertyData::String(_) => "StrProperty",
+                UObjectPropertyData::Struct(_) => "StructProperty",
+                UObjectPropertyData::UInt16(_) => "UInt16Property",
             };
 
-            let type_index = name_map.iter().position(|n| n == r#type).expect(&format!("Object type [{}] wasn't in name map", r#type)) as u64;
+            let type_index = name_map.iter().position(|n| n == r#type).unwrap_or_else(|| panic!("Object type [{}] wasn't in name map", r#type)) as u64;
             let mut data = vec![];
-            self.data.to_bytes::<_,E>(&mut data, name_map);
-            let data_size = data.len() as u32;
+            let data_size = self.data.to_bytes::<_,E>(&mut data, name_map) as u32;
 
             writer.write_u64::<E>(name_index).unwrap();
             writer.write_u64::<E>(type_index).unwrap();
@@ -203,19 +204,19 @@ impl UObjectProperty {
     }
 
     pub fn to_string<W: Write>(&self, writer: &mut W, indent_spaces: usize) {
-        writer.write(format!("{}{}: ", indent(indent_spaces), self.name).as_bytes()).unwrap();
+        writer.write_all(format!("{}{}: ", " ".repeat(indent_spaces), self.name).as_bytes()).unwrap();
         self.data.to_string(writer, indent_spaces);
     }
 
-    pub fn from_string<R: BufRead + Seek>(mut reader: &mut R, expected_indent_level: usize) -> Result<Option<Self>, Box<dyn Error>> {
-        let next_line = next_nonempty_line(&mut reader);
+    pub fn from_string<R: BufRead + Seek>(reader: &mut R, expected_indent_level: usize) -> Result<Option<Self>, Box<dyn Error>> {
+        let next_line = next_nonempty_line(reader);
         if next_line.is_empty() || !check_indent(&next_line, expected_indent_level) {
             reader.seek(SeekFrom::Current(-(next_line.len() as i64))).unwrap();
             return Ok(None);
         }
 
         let (name, val) = next_line.split_once(':').ok_or(format!("Missing ':' delimiter for property at position 0x{:x}", reader.stream_position().unwrap()))?;
-        let data = UObjectPropertyData::from_string::<R>(val, &mut reader, expected_indent_level)?;
+        let data = UObjectPropertyData::from_string::<R>(val, reader, expected_indent_level)?;
 
         Ok(Some(UObjectProperty {
             name: name.trim().to_owned(),
@@ -227,24 +228,24 @@ impl UObjectProperty {
 
 #[derive(PartialEq, Debug)]
 pub enum UObjectPropertyData {
-    BoolProperty(bool),
-    ByteProperty(u64, u8),
-    StructProperty(Vec<UObjectProperty>),
-    FloatProperty(f32),
-    StringProperty(String),
-    MapProperty(String, String, Vec<(UObjectPropertyData, UObjectPropertyData)>),
-    UInt16Property(u16),
-    IntProperty(i32),
+    Bool(bool),
+    Byte(u64, u8),
+    Struct(Vec<UObjectProperty>),
+    Float(f32),
+    String(String),
+    Map(String, String, Vec<(UObjectPropertyData, UObjectPropertyData)>),
+    UInt16(u16),
+    Int(i32),
 }
 
 impl UObjectPropertyData {
-    pub fn from_buffer<R: Read + Seek, E: byteorder::ByteOrder>(mut reader: &mut R, r#type: &str, name_map: &[String]) -> Result<Self, Box<dyn Error>> {
+    pub fn from_buffer<R: Read + Seek, E: byteorder::ByteOrder>(reader: &mut R, r#type: &str, name_map: &[String]) -> Result<Self, Box<dyn Error>> {
         match r#type {
             "BoolProperty" => {
                 let val = if reader.read_u8().unwrap() > 0 { 
-                    UObjectPropertyData::BoolProperty(true) 
+                    UObjectPropertyData::Bool(true) 
                 } else {
-                    UObjectPropertyData::BoolProperty(false)
+                    UObjectPropertyData::Bool(false)
                 };
                 let _unknown_byte = reader.read_u8().unwrap();
                 Ok(val)
@@ -253,19 +254,19 @@ impl UObjectPropertyData {
                 let enum_name = reader.read_u64::<E>().unwrap();
                 let val = reader.read_u8().unwrap();
                 let _unknown_byte = reader.read_u8().unwrap();
-                Ok(UObjectPropertyData::ByteProperty(enum_name, val))
+                Ok(UObjectPropertyData::Byte(enum_name, val))
             },
             "StructProperty" => {
                 let mut props = vec![];
-                while let Some(prop) = UObjectProperty::from_buffer::<R,E>(&mut reader, name_map)? {
+                while let Some(prop) = UObjectProperty::from_buffer::<R,E>(reader, name_map)? {
                     props.push(prop);
                 }
-                Ok(UObjectPropertyData::StructProperty(props))
+                Ok(UObjectPropertyData::Struct(props))
             },
             "FloatProperty" => {
                 let _unknown_byte = reader.read_u8().unwrap();
                 let val = reader.read_f32::<E>().unwrap();
-                Ok(UObjectPropertyData::FloatProperty(val))
+                Ok(UObjectPropertyData::Float(val))
             },
             "StrProperty" => {
                 let _unknown_byte = reader.read_u8().unwrap();
@@ -276,7 +277,7 @@ impl UObjectPropertyData {
                 if reader.read_u8().unwrap() != 0 {
                     Err(format!("Malformed FString at byte 0x{:x} - length or termination byte is incorrect", reader.stream_position().unwrap()))?;
                 }
-                Ok(UObjectPropertyData::StringProperty(String::from_utf8(raw_string).unwrap()))
+                Ok(UObjectPropertyData::String(String::from_utf8(raw_string).unwrap()))
             },
             "MapProperty" => {
                 let key_type = reader.read_u64::<E>().unwrap() as usize;
@@ -292,20 +293,20 @@ impl UObjectPropertyData {
                 let mut sets = vec![];
 
                 for _ in 0..arr_size {
-                    let next_key = UObjectPropertyData::from_buffer::<R,E>(&mut reader, key_type, name_map)?;
-                    let next_value = UObjectPropertyData::from_buffer::<R,E>(&mut reader, value_type, name_map)?;
+                    let next_key = UObjectPropertyData::from_buffer::<R,E>(reader, key_type, name_map)?;
+                    let next_value = UObjectPropertyData::from_buffer::<R,E>(reader, value_type, name_map)?;
                     sets.push((next_key, next_value));
                 }
 
-                Ok(UObjectPropertyData::MapProperty(key_type.clone(), value_type.clone(), sets))
+                Ok(UObjectPropertyData::Map(key_type.clone(), value_type.clone(), sets))
             },
             "UInt16Property" => {
                 let _unknown_byte = reader.read_u8().unwrap();
-                Ok(UObjectPropertyData::UInt16Property(reader.read_u16::<E>().unwrap()))
+                Ok(UObjectPropertyData::UInt16(reader.read_u16::<E>().unwrap()))
             },
             "IntProperty" => {
                 let val = reader.read_i32::<E>().unwrap();
-                Ok(UObjectPropertyData::IntProperty(val))
+                Ok(UObjectPropertyData::Int(val))
             }
             _ => {
                 Err(format!("Unhandled property type: {}", r#type))?
@@ -313,40 +314,40 @@ impl UObjectPropertyData {
         }
     }
 
-    pub fn to_bytes<W: Write, E: byteorder::ByteOrder>(&self, mut writer: &mut W, name_map: &[String]) -> usize {
+    pub fn to_bytes<W: Write, E: byteorder::ByteOrder>(&self, writer: &mut W, name_map: &[String]) -> usize {
         match self {
-            Self::BoolProperty(val) => {
+            Self::Bool(val) => {
                 if *val {
                     writer.write_u8(1).unwrap(); // true
                 } else {
                     writer.write_u8(0).unwrap(); // false
                 }
                 writer.write_u8(0).unwrap();  // Unknown value - seems to be 0?
-                2
+                0 // Not sure why this needs to be 0...
             },
-            Self::ByteProperty(enum_name, val, ) => {
+            Self::Byte(enum_name, val, ) => {
                 writer.write_u64::<E>(*enum_name).unwrap();
                 writer.write_u8(*val).unwrap();
                 writer.write_u8(0).unwrap();  // Unknown value - seems to be 0?
 
-                8 + 2
+                1  // Not sure why this needs to be 1... maybe val can be bigger than a u8?
             },
-            Self::StructProperty(val) => {
+            Self::Struct(val) => {
                 let mut len = 0;
                 for v in val {
-                    len += v.to_bytes::<W,E>(&mut writer, name_map);
+                    len += v.to_bytes::<W,E>(writer, name_map);
                 }
-                let none_index = name_map.iter().position(|n| n == "None").expect(&format!("Object type [None] wasn't in name map")) as u64;
+                let none_index = name_map.iter().position(|n| n == "None").unwrap_or_else(|| panic!("Object type [None] wasn't in name map")) as u64;
                 writer.write_u64::<E>(none_index).unwrap();
                 len += std::mem::size_of::<u64>();
                 len
             },
-            Self::FloatProperty(val) => {
+            Self::Float(val) => {
                 writer.write_u8(0).unwrap();  // Unknown value - seems to be 0?
                 writer.write_f32::<E>(*val).unwrap();
-                5
+                4
             },
-            Self::StringProperty(val) => {
+            Self::String(val) => {
                 writer.write_u8(0).unwrap();  // Unknown value - seems to be 0?
 
                 let len = val.len() + 1; // +1 for termination byte
@@ -354,11 +355,11 @@ impl UObjectPropertyData {
                 writer.write_all(val.as_bytes()).unwrap();
                 writer.write_u8(0).unwrap();  // FString termination byte
                 
-                1 + 4 + len
+                4 + len
             },
-            Self::MapProperty(key_type, val_type, val) => {
-                let key_type_index = name_map.iter().position(|n| n == key_type).expect(&format!("Object type [{}] wasn't in name map", key_type)) as u64;
-                let val_type_index = name_map.iter().position(|n| n == val_type).expect(&format!("Object type [{}] wasn't in name map", val_type)) as u64;
+            Self::Map(key_type, val_type, val) => {
+                let key_type_index = name_map.iter().position(|n| n == key_type).unwrap_or_else(|| panic!("Object type [{}] wasn't in name map", key_type)) as u64;
+                let val_type_index = name_map.iter().position(|n| n == val_type).unwrap_or_else(|| panic!("Object type [{}] wasn't in name map", val_type)) as u64;
 
                 writer.write_u64::<E>(key_type_index).unwrap();
                 writer.write_u64::<E>(val_type_index).unwrap();
@@ -369,90 +370,90 @@ impl UObjectPropertyData {
                 writer.write_u32::<E>(val.len() as u32).unwrap();
                 
 
-                let mut size = 8 + 8 + 1 + 4 + 4;
+                let mut size = 8; // Seems like final size is 8 + map data size...?
 
                 for v in val {
-                    size += v.0.to_bytes::<W,E>(&mut writer, name_map);
-                    size += v.1.to_bytes::<W,E>(&mut writer, name_map);
+                    size += v.0.to_bytes::<W,E>(writer, name_map);
+                    size += v.1.to_bytes::<W,E>(writer, name_map);
                 }
 
                 size
             },
-            Self::UInt16Property(val) => {
+            Self::UInt16(val) => {
                 writer.write_u8(0).unwrap();  // Unknown value - seems to be 0?
                 writer.write_u16::<E>(*val).unwrap();
-                3
+                2
             },
-            Self::IntProperty(val) => {
+            Self::Int(val) => {
                 writer.write_i32::<E>(*val).unwrap();
                 4
             },
         }
     }
 
-    pub fn to_string<W: Write>(&self, mut writer: &mut W, indent_spaces: usize) {
+    pub fn to_string<W: Write>(&self, writer: &mut W, indent_spaces: usize) {
         match self {
-            Self::BoolProperty(val) => {
+            Self::Bool(val) => {
                 if *val {
-                    writer.write("true\n".as_bytes()).unwrap();
+                    writer.write_all("true\n".as_bytes()).unwrap();
                 } else {
-                    writer.write("false\n".as_bytes()).unwrap();
+                    writer.write_all("false\n".as_bytes()).unwrap();
                 }
             },
-            Self::ByteProperty(enum_name, val, ) => {
-                writer.write(format!("!ByteProperty {enum_name:x} {val:x}\n").as_bytes()).unwrap();
+            Self::Byte(enum_name, val, ) => {
+                writer.write_all(format!("!ByteProperty {enum_name:x} {val:x}\n").as_bytes()).unwrap();
             },
-            Self::StructProperty(val) => {
-                writer.write("\n".as_bytes()).unwrap();
+            Self::Struct(val) => {
+                writer.write_all("\n".as_bytes()).unwrap();
 
                 for v in val {
-                    v.to_string::<W>(&mut writer, indent_spaces + 2);
+                    v.to_string::<W>(writer, indent_spaces + 2);
                 }
             },
-            Self::FloatProperty(val) => {
-                writer.write(format!("{:.4}\n", val).as_bytes()).unwrap();
+            Self::Float(val) => {
+                writer.write_all(format!("{:.4}\n", val).as_bytes()).unwrap();
             },
-            Self::StringProperty(val) => {
-                writer.write(format!("{val}\n").as_bytes()).unwrap();
+            Self::String(val) => {
+                writer.write_all(format!("{val}\n").as_bytes()).unwrap();
             },
-            Self::MapProperty(key_type, val_type, val) => {
-                writer.write("!Map\n".as_bytes()).unwrap();
+            Self::Map(key_type, val_type, val) => {
+                writer.write_all("!Map\n".as_bytes()).unwrap();
 
-                let indention = indent(indent_spaces + 2);
-                writer.write(format!("{}key_type: {key_type}\n", indention).as_bytes()).unwrap();
-                writer.write(format!("{}val_type: {val_type}\n", indention).as_bytes()).unwrap();
-                writer.write(format!("{}map_data:\n", indention).as_bytes()).unwrap();
+                let indention = " ".repeat(indent_spaces + 2);
+                writer.write_all(format!("{}key_type: {key_type}\n", indention).as_bytes()).unwrap();
+                writer.write_all(format!("{}val_type: {val_type}\n", indention).as_bytes()).unwrap();
+                writer.write_all(format!("{}map_data:\n", indention).as_bytes()).unwrap();
 
                 for v in val {
                     let key_string = match &v.0 {
-                        Self::BoolProperty(v) => { if *v { "true".to_string() } else { "false".to_string() }},
-                        Self::IntProperty(v) => v.to_string(),
-                        Self::UInt16Property(v) => v.to_string(),
-                        Self::StringProperty(v) => v.clone(),
-                        Self::FloatProperty(v) => format!("{v:.4}"),
+                        Self::Bool(v) => { if *v { "true".to_string() } else { "false".to_string() }},
+                        Self::Int(v) => v.to_string(),
+                        Self::UInt16(v) => v.to_string(),
+                        Self::String(v) => v.clone(),
+                        Self::Float(v) => format!("{v:.4}"),
                         _ => panic!("Unprintable map key type: {key_type}")
                     };
-                    writer.write(format!("{}- {}:", indent(indent_spaces + 4), key_string).as_bytes()).unwrap();
-                    v.1.to_string::<W>(&mut writer, indent_spaces + 6);
+                    writer.write_all(format!("{}- {}:", " ".repeat(indent_spaces + 4), key_string).as_bytes()).unwrap();
+                    v.1.to_string::<W>(writer, indent_spaces + 6);
                 }
             },
-            Self::UInt16Property(val) => {
-                writer.write(format!("!u16 {val}\n").as_bytes()).unwrap();
+            Self::UInt16(val) => {
+                writer.write_all(format!("!u16 {val}\n").as_bytes()).unwrap();
             },
-            Self::IntProperty(val) => {
-                writer.write(format!("!i32 {val}\n").as_bytes()).unwrap();
+            Self::Int(val) => {
+                writer.write_all(format!("!i32 {val}\n").as_bytes()).unwrap();
             },
         }
     }
 
-    pub fn from_string<R: BufRead + Seek>(val: &str, mut reader: &mut R, expected_indent_level: usize) -> Result<Self, Box<dyn Error>> {
+    pub fn from_string<R: BufRead + Seek>(val: &str, reader: &mut R, expected_indent_level: usize) -> Result<Self, Box<dyn Error>> {
         let val = val.trim();
         if val.is_empty() { // Struct start
             let mut props = vec![];
-            while let Some(prop) = UObjectProperty::from_string::<R>(&mut reader, expected_indent_level + 2)? {
+            while let Some(prop) = UObjectProperty::from_string::<R>(reader, expected_indent_level + 2)? {
                 props.push(prop);
             }
-            Ok(UObjectPropertyData::StructProperty(props))
+            Ok(UObjectPropertyData::Struct(props))
         } else if val.starts_with("!Map") {
             let start_position = reader.stream_position().unwrap();
             let mut key_type:   Option<String> = None;
@@ -460,7 +461,7 @@ impl UObjectPropertyData {
             let mut sets = vec![];
 
             for _ in 0..3 {
-                let next_line = next_nonempty_line(&mut reader);
+                let next_line = next_nonempty_line(reader);
                 if !check_indent(&next_line, expected_indent_level + 2) {
                     Err(format!("Map at 0x{start_position:x} should have properties (in order): key_type, val_type, map_data"))?;
                 }
@@ -479,7 +480,7 @@ impl UObjectPropertyData {
 
                         let format_err = format!("Map at 0x{start_position:x} - map_data should use format ' - key: value'");
                         loop {
-                            let next_line = next_nonempty_line(&mut reader);
+                            let next_line = next_nonempty_line(reader);
                             if !next_line.trim().starts_with('-') || !check_indent(&next_line, expected_indent_level + 4) {
                                 reader.seek(SeekFrom::Current(-(next_line.len() as i64))).unwrap();
                                 break;
@@ -488,28 +489,28 @@ impl UObjectPropertyData {
                             let (key, val) = next_line.split_once('-').ok_or(format_err.clone())?.1.split_once(':').ok_or(format_err.clone())?;
                             let key = key.trim();
                             let key = match key_type.as_ref().unwrap().as_str() {
-                                "BoolProperty" => UObjectPropertyData::BoolProperty(key.parse()?),
-                                "IntProperty" => UObjectPropertyData::IntProperty(key.parse()?),
-                                "UInt16Property" => UObjectPropertyData::UInt16Property(key.parse()?),
-                                "StrProperty" => UObjectPropertyData::StringProperty(key.to_owned()),
-                                "FloatProperty" => UObjectPropertyData::FloatProperty(key.parse()?),
+                                "BoolProperty" => UObjectPropertyData::Bool(key.parse()?),
+                                "IntProperty" => UObjectPropertyData::Int(key.parse()?),
+                                "UInt16Property" => UObjectPropertyData::UInt16(key.parse()?),
+                                "StrProperty" => UObjectPropertyData::String(key.to_owned()),
+                                "FloatProperty" => UObjectPropertyData::Float(key.parse()?),
                                 other => Err(format!("Map at 0x{start_position:x} - unable to read data of key type '{other}'"))?,
                             };
-                            let val = UObjectPropertyData::from_string::<R>(val, &mut reader, expected_indent_level + 6)?;
+                            let val = UObjectPropertyData::from_string::<R>(val, reader, expected_indent_level + 6)?;
                             sets.push((key, val));
                         }
 
                         let val_type = value_type.as_ref().unwrap().as_str();
                         for set in &sets {
                             let set_val_type = match set.1 {
-                                UObjectPropertyData::BoolProperty(_) => "BoolProperty",
-                                UObjectPropertyData::ByteProperty(_, _) => "ByteProperty",
-                                UObjectPropertyData::StructProperty(_) => "StructProperty",
-                                UObjectPropertyData::FloatProperty(_) => "FloatProperty",
-                                UObjectPropertyData::StringProperty(_) => "StrProperty",
-                                UObjectPropertyData::MapProperty(_, _, _) => "MapProperty",
-                                UObjectPropertyData::UInt16Property(_) => "UInt16Property",
-                                UObjectPropertyData::IntProperty(_) => "IntProperty",
+                                UObjectPropertyData::Bool(_) => "BoolProperty",
+                                UObjectPropertyData::Byte(_, _) => "ByteProperty",
+                                UObjectPropertyData::Struct(_) => "StructProperty",
+                                UObjectPropertyData::Float(_) => "FloatProperty",
+                                UObjectPropertyData::String(_) => "StrProperty",
+                                UObjectPropertyData::Map(_, _, _) => "MapProperty",
+                                UObjectPropertyData::UInt16(_) => "UInt16Property",
+                                UObjectPropertyData::Int(_) => "IntProperty",
                             };
                             if set_val_type != val_type {
                                 Err(format!("Map at 0x{start_position:x} - expected value type '{val_type}', but got '{set_val_type}'"))?;
@@ -524,18 +525,18 @@ impl UObjectPropertyData {
                 Err(format!("Map at 0x{start_position:x} - missing map_data!"))?;
             }
 
-            Ok(UObjectPropertyData::MapProperty(
+            Ok(UObjectPropertyData::Map(
                 key_type.ok_or(format!("Map at 0x{start_position:x} - missing key_type!"))?,
                 value_type.ok_or(format!("Map at 0x{start_position:x} - missing val_type!"))?,
                 sets
             ))
 
         } else if val.starts_with("!u16") {
-            let (_, u16value) = val.split_once(" ").ok_or(format!("Error at 0x{:x}: !u16 should have one integer parameter", reader.stream_position().unwrap()))?;
-            Ok(UObjectPropertyData::UInt16Property(u16::from_str_radix(u16value, 10)?))
+            let (_, u16value) = val.split_once(' ').ok_or(format!("Error at 0x{:x}: !u16 should have one integer parameter", reader.stream_position().unwrap()))?;
+            Ok(UObjectPropertyData::UInt16(u16value.parse::<u16>()?))
         } else if val.starts_with("!i32") {
-            let (_, i32value) = val.split_once(" ").ok_or(format!("Error at 0x{:x}: !i32 should have one integer parameter", reader.stream_position().unwrap()))?;
-            Ok(UObjectPropertyData::IntProperty(i32::from_str_radix(i32value, 10)?))
+            let (_, i32value) = val.split_once(' ').ok_or(format!("Error at 0x{:x}: !i32 should have one integer parameter", reader.stream_position().unwrap()))?;
+            Ok(UObjectPropertyData::Int(i32value.parse::<i32>()?))
         } else if val.starts_with("!ByteProperty") {
             let mut vals = val.split_whitespace();
             vals.next().unwrap(); // !ByteProperty
@@ -544,29 +545,25 @@ impl UObjectPropertyData {
             let enum_id = vals.next().ok_or(err.clone())?;
             let enum_val = vals.next().ok_or(err)?;
             
-            Ok(UObjectPropertyData::ByteProperty(u64::from_str_radix(enum_id, 16)?, u8::from_str_radix(enum_val, 16)?))
+            Ok(UObjectPropertyData::Byte(u64::from_str_radix(enum_id, 16)?, u8::from_str_radix(enum_val, 16)?))
         } else if let Ok(val) = val.parse::<f32>() {
-            Ok(UObjectPropertyData::FloatProperty(val))
+            Ok(UObjectPropertyData::Float(val))
         } else if let Ok(val) = val.parse::<bool>() {
-            Ok(UObjectPropertyData::BoolProperty(val))
+            Ok(UObjectPropertyData::Bool(val))
         } else {
-            Ok(UObjectPropertyData::StringProperty(val.to_owned()))
+            Ok(UObjectPropertyData::String(val.to_owned()))
         }
     }
 }
 
-fn indent(spaces: usize) -> String {
-    iter::repeat(' ').take(spaces).collect()
-}
-
 fn check_indent(val: &str, spaces: usize) -> bool {
-    val.replace("\t", "  ").chars().take(spaces).all(|c| c == ' ')
+    val.replace('\t', "  ").chars().take(spaces).all(|c| c == ' ')
 }
 
 /// 
 /// Returns the next non-empty line in the reader.  If an empty line is returned, the reader has reached EOF.
 /// 
-fn next_nonempty_line<R: BufRead + Seek>(mut reader: &mut R) -> String {
+fn next_nonempty_line<R: BufRead + Seek>(reader: &mut R) -> String {
     let mut line = String::new();
     while line.trim().is_empty() {
         line.clear();
@@ -583,10 +580,10 @@ pub struct IoUObject {
 }
 
 impl IoUObject {
-    pub fn from_buffer<R: Read + Seek, E: byteorder::ByteOrder>(mut reader: &mut R) -> Result<Self, Box<dyn Error>> {
-        let summary = UObjectSummary::from_buffer::<R,E>(&mut reader)?;
+    pub fn from_buffer<R: Read + Seek, E: byteorder::ByteOrder>(reader: &mut R) -> Result<Self, Box<dyn Error>> {
+        let summary = UObjectSummary::from_buffer::<R,E>(reader)?;
         let mut properties = vec![];
-        while let Some(prop) = UObjectProperty::from_buffer::<R,E>(&mut reader, &summary.name_map)? {
+        while let Some(prop) = UObjectProperty::from_buffer::<R,E>(reader, &summary.name_map)? {
             properties.push(prop);
         }
 
@@ -601,27 +598,28 @@ impl IoUObject {
         for prop in &self.properties {
             prop.to_bytes::<_,E>(&mut properties_bytes, &self.summary.name_map);
         }
-        let none_index = self.summary.name_map.iter().position(|n| n == "None").expect(&format!("Object type [None] wasn't in name map")) as u64;
+        let none_index = self.summary.name_map.iter().position(|n| n == "None").unwrap_or_else(|| panic!("Object type [None] wasn't in name map")) as u64;
         properties_bytes.write_u64::<E>(none_index).unwrap();
 
         let summary_bytes = self.summary.to_bytes::<E>();
-        writer.write(&summary_bytes).unwrap();
-        writer.write(&properties_bytes).unwrap();
+        writer.write_all(&summary_bytes).unwrap();
+        writer.write_all(&properties_bytes).unwrap();
+        writer.write_all(&[0;4]).unwrap();
 
-        summary_bytes.len() + properties_bytes.len()
+        summary_bytes.len() + properties_bytes.len() + 4
     }
 
-    pub fn to_string<W: Write>(&self, mut writer: &mut W) {
-        writer.write(format!("summary: {}\n", self.summary.to_string()).as_bytes()).unwrap();
-        writer.write("contents:\n".as_bytes()).unwrap();
+    pub fn to_string<W: Write>(&self, writer: &mut W) {
+        writer.write_all(format!("summary: {}\n", self.summary).as_bytes()).unwrap();
+        writer.write_all("contents:\n".as_bytes()).unwrap();
 
         for prop in &self.properties {
             let indent_spaces = 2usize;
-            prop.to_string(&mut writer, indent_spaces);
+            prop.to_string(writer, indent_spaces);
         }
     }
 
-    pub fn from_string<R: BufRead + Seek>(mut reader: &mut R) -> Result<Self, Box<dyn Error>> {
+    pub fn from_string<R: BufRead + Seek>(reader: &mut R) -> Result<Self, Box<dyn Error>> {
         let mut line = String::new();
         reader.read_line(&mut line).unwrap();
 
@@ -640,7 +638,7 @@ impl IoUObject {
         }
 
         let mut properties = vec![];
-        while let Some(prop) = UObjectProperty::from_string::<R>(&mut reader, 2)? {
+        while let Some(prop) = UObjectProperty::from_string::<R>(reader, 2)? {
             properties.push(prop);
         }
 
@@ -702,7 +700,7 @@ mod test {
             UObjectProperty {
                 name: "TestBool".to_string(),
                 arr_index: 0,
-                data: UObjectPropertyData::BoolProperty(v)
+                data: UObjectPropertyData::Bool(v)
             }
         };
 
@@ -710,7 +708,7 @@ mod test {
             UObjectProperty {
                 name: "TestByte".to_string(),
                 arr_index: 0,
-                data: UObjectPropertyData::ByteProperty(t,v)
+                data: UObjectPropertyData::Byte(t,v)
             }
         };
 
@@ -718,7 +716,7 @@ mod test {
             UObjectProperty {
                 name: "TestInt".to_string(),
                 arr_index: 0,
-                data: UObjectPropertyData::IntProperty(v)
+                data: UObjectPropertyData::Int(v)
             }
         };
 
@@ -726,7 +724,7 @@ mod test {
             UObjectProperty {
                 name: "TestFloat".to_string(),
                 arr_index: 0,
-                data: UObjectPropertyData::FloatProperty(v)
+                data: UObjectPropertyData::Float(v)
             }
         };
 
@@ -734,7 +732,7 @@ mod test {
             UObjectProperty {
                 name: "TestString".to_string(),
                 arr_index: 0,
-                data: UObjectPropertyData::StringProperty(v.to_string())
+                data: UObjectPropertyData::String(v.to_string())
             }
         };
         
@@ -749,10 +747,10 @@ mod test {
                 UObjectProperty {
                     name: "TestMap".to_string(),
                     arr_index: 0,
-                    data: UObjectPropertyData::MapProperty("IntProperty".to_string(), "StructProperty".to_string(), vec![
+                    data: UObjectPropertyData::Map("IntProperty".to_string(), "StructProperty".to_string(), vec![
                         (
-                            UObjectPropertyData::IntProperty(0),
-                            UObjectPropertyData::StructProperty(vec![
+                            UObjectPropertyData::Int(0),
+                            UObjectPropertyData::Struct(vec![
                                 mkint(0),
                                 mkint(1),
                                 mkint(2),
@@ -760,8 +758,8 @@ mod test {
                             ])
                         ),
                         (
-                            UObjectPropertyData::IntProperty(1),
-                            UObjectPropertyData::StructProperty(vec![
+                            UObjectPropertyData::Int(1),
+                            UObjectPropertyData::Struct(vec![
                                 mkbool(true),
                                 mkbool(false),
                                 mkbyte(7,7),
@@ -769,36 +767,36 @@ mod test {
                             ])
                         ),
                         (
-                            UObjectPropertyData::IntProperty(2),
-                            UObjectPropertyData::StructProperty(vec![
+                            UObjectPropertyData::Int(2),
+                            UObjectPropertyData::Struct(vec![
                                 UObjectProperty { 
                                     name: "TestMap".to_string(), 
                                     arr_index: 0, 
-                                    data: UObjectPropertyData::MapProperty("StrProperty".to_string(), "IntProperty".to_string(), vec![
-                                        (UObjectPropertyData::StringProperty("Prop1".to_string()), UObjectPropertyData::IntProperty(5)),
-                                        (UObjectPropertyData::StringProperty("TestProp2".to_string()), UObjectPropertyData::IntProperty(7)),
+                                    data: UObjectPropertyData::Map("StrProperty".to_string(), "IntProperty".to_string(), vec![
+                                        (UObjectPropertyData::String("Prop1".to_string()), UObjectPropertyData::Int(5)),
+                                        (UObjectPropertyData::String("TestProp2".to_string()), UObjectPropertyData::Int(7)),
                                     ])
                                 }
                             ])
                         ),
                         (
-                            UObjectPropertyData::IntProperty(30),
-                            UObjectPropertyData::StructProperty(vec![
+                            UObjectPropertyData::Int(30),
+                            UObjectPropertyData::Struct(vec![
                                 mkstr("SkipMapKeys")
                             ])
                         ),
                         (
-                            UObjectPropertyData::IntProperty(2),
-                            UObjectPropertyData::StructProperty(vec![
+                            UObjectPropertyData::Int(2),
+                            UObjectPropertyData::Struct(vec![
                                 UObjectProperty { 
                                     name: "TestMap".to_string(), 
                                     arr_index: 0, 
-                                    data: UObjectPropertyData::MapProperty("StrProperty".to_string(), "StructProperty".to_string(), vec![
-                                        (UObjectPropertyData::StringProperty("Prop1".to_string()), UObjectPropertyData::StructProperty(vec![
+                                    data: UObjectPropertyData::Map("StrProperty".to_string(), "StructProperty".to_string(), vec![
+                                        (UObjectPropertyData::String("Prop1".to_string()), UObjectPropertyData::Struct(vec![
                                             mkstr("NestedStruct"),
                                             mkfloat(77f32),
                                         ])),
-                                        (UObjectPropertyData::StringProperty("TestProp2".to_string()), UObjectPropertyData::StructProperty(vec![
+                                        (UObjectPropertyData::String("TestProp2".to_string()), UObjectPropertyData::Struct(vec![
                                             mkbyte(25,6),
                                             mkstr("TestEndMapOnNestedStruct"),
                                         ])),
@@ -865,7 +863,6 @@ mod test {
         let mut serialized_string = Cursor::new(vec![]);
         test.to_string(&mut serialized_string);
         serialized_string.set_position(0);
-        std::io::stdout().write_all(serialized_string.get_ref()).unwrap();
         match IoUObject::from_string(&mut serialized_string) {
             Ok(deserialized) => assert_equality(deserialized, get_test_object()),
             Err(err) => panic!("{:?}",err),

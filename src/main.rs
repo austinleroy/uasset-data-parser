@@ -27,7 +27,7 @@ fn execute(config: Config) -> Result<(), Box<dyn Error>> {
                 println!("WARNING: Encoding a file that does not have the '.yaml_uasset' extension");
             }
             let mut outfile = match config.outpath {
-                Some(path) => File::open(path)?,
+                Some(path) => File::create(path)?,
                 None => {
                     let infilename = config.inpath.rsplit_once(std::path::MAIN_SEPARATOR_STR).map(|f| f.1).unwrap_or(&config.inpath);
                     let outfilename = infilename.rsplit_once('.').map(|f| f.0).unwrap_or(infilename);
@@ -35,10 +35,22 @@ fn execute(config: Config) -> Result<(), Box<dyn Error>> {
                 }
             };
             let object = IoUObject::from_string(&mut BufReader::new(infile))?;
-            object.to_bytes::<_,LE>(&mut outfile);
+            object.to_bytes::<_, LE>(&mut outfile);
         },
         Command::Decode => {
-
+            if !config.inpath.ends_with(".uasset") {
+                println!("WARNING: Decoding a file that does not have the '.uasset' extension");
+            }
+            let mut outfile = match config.outpath {
+                Some(path) => File::create(path)?,
+                None => {
+                    let infilename = config.inpath.rsplit_once(std::path::MAIN_SEPARATOR_STR).map(|f| f.1).unwrap_or(&config.inpath);
+                    let outfilename = infilename.rsplit_once('.').map(|f| f.0).unwrap_or(infilename);
+                    File::create(format!("{outfilename}.yaml_uasset"))?
+                }
+            };
+            let object = IoUObject::from_buffer::<_, LE>(&mut BufReader::new(infile))?;
+            object.to_string(&mut outfile);
         },
     }
     Ok(())
