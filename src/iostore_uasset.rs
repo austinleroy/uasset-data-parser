@@ -1,6 +1,6 @@
 use base64::{prelude::BASE64_STANDARD, Engine};
 use byteorder::{ReadBytesExt, WriteBytesExt, LE};
-use std::{error::Error, io::{BufRead, Cursor, Read, Seek, Write}, iter};
+use std::{error::Error, io::{BufRead, Cursor, Read, Seek, Write, SeekFrom}, iter};
 
 struct UObjectSummaryHeader {
     name: u64,     
@@ -208,20 +208,13 @@ impl UObjectProperty {
     }
 
     pub fn from_string<R: BufRead + Seek>(mut reader: &mut R, expected_indent_level: usize) -> Result<Option<Self>, Box<dyn Error>> {
-        let peek = reader.fill_buf().unwrap();
-        if peek.iter().flat_map(|c| if *c == b'\t' { vec![b' ', b' '] } else { vec![*c] }).take(expected_indent_level).any(|c| !(c as char).is_whitespace()) {
-            // Not as much indentation as expected, so probably the end of a struct
+        let next_line = next_nonempty_line(&mut reader);
+        if next_line.is_empty() || !check_indent(&next_line, expected_indent_level) {
+            reader.seek(SeekFrom::Current(-(next_line.len() as i64))).unwrap();
             return Ok(None);
         }
 
-        let mut line = String::new();
-        while line.trim().is_empty() {
-            if reader.read_line(&mut line).unwrap() == 0 {
-                return Ok(None);
-            }
-        }
-
-        let (name, val) = line.split_once(':').ok_or(format!("Missing ':' delimiter for property at position 0x{:x}", reader.stream_position().unwrap()))?;
+        let (name, val) = next_line.split_once(':').ok_or(format!("Missing ':' delimiter for property at position 0x{:x}", reader.stream_position().unwrap()))?;
         let data = UObjectPropertyData::from_string::<R>(val, &mut reader, expected_indent_level)?;
 
         Ok(Some(UObjectProperty {
@@ -466,14 +459,13 @@ impl UObjectPropertyData {
             let mut value_type: Option<String> = None;
             let mut sets = vec![];
 
-            let mut next_line = String::new();
             for _ in 0..3 {
-                reader.read_line(&mut next_line).unwrap();
-                if next_line.replace("\t", "  ").chars().take(expected_indent_level + 2).any(|c| c != ' ') {
-                    Err(format!("Map at 0x{start_position:x} should have properties: key_type, val_type, map_data"))?;
+                let next_line = next_nonempty_line(&mut reader);
+                if !check_indent(&next_line, expected_indent_level + 2) {
+                    Err(format!("Map at 0x{start_position:x} should have properties (in order): key_type, val_type, map_data"))?;
                 }
 
-                let (key, val) = next_line.split_once(':').ok_or(format!("Map at 0x{:x} - expected key_type or val_type property, but got:\n{}", start_position, next_line.trim()))?;
+                let (key, val) = next_line.split_once(':').ok_or(format!("Map at 0x{:x} - expected [key_type:] or [val_type:] property, but got:\n{}", start_position, next_line.trim()))?;
                 match key.trim() {
                     "key_type" => { key_type = Some(val.trim().to_owned()); },
                     "val_type" => { value_type = Some(val.trim().to_owned()); },
@@ -481,30 +473,55 @@ impl UObjectPropertyData {
                         if key_type.is_none() {
                             Err(format!("Map at 0x{start_position:x} - key_type should come before map_data"))?;
                         }
-
-                        let format_err = format!("Map at 0x{start_position:x} - map_data should use format ' - key: value'");
-                        reader.read_line(&mut next_line).unwrap();
-                        if next_line.replace("\t", "  ").chars().take(expected_indent_level + 2).any(|c| c != ' ') {
-                            Err(format_err.clone())?;
+                        if value_type.is_none() {
+                            Err(format!("Map at 0x{start_position:x} - val_type should come before map_data"))?;
                         }
 
-                        let (key, val) = next_line.split_once('-').ok_or(format_err.clone())?.1.split_once(':').ok_or(format_err.clone())?;
-                        let key = key.trim();
-                        let key = match key_type.as_ref().unwrap().as_str() {
-                            "BoolProperty" => UObjectPropertyData::BoolProperty(key.parse()?),
-                            "IntProperty" => UObjectPropertyData::IntProperty(key.parse()?),
-                            "UInt16Property" => UObjectPropertyData::UInt16Property(key.parse()?),
-                            "StrProperty" => UObjectPropertyData::StringProperty(key.to_owned()),
-                            "FloatProperty" => UObjectPropertyData::FloatProperty(key.parse()?),
-                            other => Err(format!("Map at 0x{start_position:x} - unable to read data of key type '{other}'"))?,
-                        };
-                        let val = UObjectPropertyData::from_string::<R>(val, &mut reader, expected_indent_level + 2)?;
-                        sets.push((key, val));
+                        let format_err = format!("Map at 0x{start_position:x} - map_data should use format ' - key: value'");
+                        loop {
+                            let next_line = next_nonempty_line(&mut reader);
+                            if !next_line.trim().starts_with('-') || !check_indent(&next_line, expected_indent_level + 4) {
+                                reader.seek(SeekFrom::Current(-(next_line.len() as i64))).unwrap();
+                                break;
+                            }
+    
+                            let (key, val) = next_line.split_once('-').ok_or(format_err.clone())?.1.split_once(':').ok_or(format_err.clone())?;
+                            let key = key.trim();
+                            let key = match key_type.as_ref().unwrap().as_str() {
+                                "BoolProperty" => UObjectPropertyData::BoolProperty(key.parse()?),
+                                "IntProperty" => UObjectPropertyData::IntProperty(key.parse()?),
+                                "UInt16Property" => UObjectPropertyData::UInt16Property(key.parse()?),
+                                "StrProperty" => UObjectPropertyData::StringProperty(key.to_owned()),
+                                "FloatProperty" => UObjectPropertyData::FloatProperty(key.parse()?),
+                                other => Err(format!("Map at 0x{start_position:x} - unable to read data of key type '{other}'"))?,
+                            };
+                            let val = UObjectPropertyData::from_string::<R>(val, &mut reader, expected_indent_level + 6)?;
+                            sets.push((key, val));
+                        }
+
+                        let val_type = value_type.as_ref().unwrap().as_str();
+                        for set in &sets {
+                            let set_val_type = match set.1 {
+                                UObjectPropertyData::BoolProperty(_) => "BoolProperty",
+                                UObjectPropertyData::ByteProperty(_, _) => "ByteProperty",
+                                UObjectPropertyData::StructProperty(_) => "StructProperty",
+                                UObjectPropertyData::FloatProperty(_) => "FloatProperty",
+                                UObjectPropertyData::StringProperty(_) => "StrProperty",
+                                UObjectPropertyData::MapProperty(_, _, _) => "MapProperty",
+                                UObjectPropertyData::UInt16Property(_) => "UInt16Property",
+                                UObjectPropertyData::IntProperty(_) => "IntProperty",
+                            };
+                            if set_val_type != val_type {
+                                Err(format!("Map at 0x{start_position:x} - expected value type '{val_type}', but got '{set_val_type}'"))?;
+                            }
+                        }
                     }
                     _ => { Err(format!("Map at 0x{:x} - expected key_type or val_type, but got {}", start_position, key.trim()))?; }
                 }
+            }
 
-                next_line.clear();
+            if sets.is_empty() {
+                Err(format!("Map at 0x{start_position:x} - missing map_data!"))?;
             }
 
             Ok(UObjectPropertyData::MapProperty(
@@ -540,6 +557,24 @@ impl UObjectPropertyData {
 
 fn indent(spaces: usize) -> String {
     iter::repeat(' ').take(spaces).collect()
+}
+
+fn check_indent(val: &str, spaces: usize) -> bool {
+    val.replace("\t", "  ").chars().take(spaces).all(|c| c == ' ')
+}
+
+/// 
+/// Returns the next non-empty line in the reader.  If an empty line is returned, the reader has reached EOF.
+/// 
+fn next_nonempty_line<R: BufRead + Seek>(mut reader: &mut R) -> String {
+    let mut line = String::new();
+    while line.trim().is_empty() {
+        line.clear();
+        if reader.read_line(&mut line).unwrap() == 0 {
+            break;
+        }
+    }
+    line
 }
 
 pub struct IoUObject {
@@ -620,7 +655,7 @@ impl IoUObject {
 #[allow(unused_imports)]
 mod test {
     use byteorder::LE;
-    use std::io::Cursor;
+    use std::io::{Cursor, Write};
 
     use super::{IoUObject, UObjectSummary, UObjectSummaryHeader, UObjectProperty, UObjectPropertyData};
 
@@ -734,14 +769,47 @@ mod test {
                             ])
                         ),
                         (
+                            UObjectPropertyData::IntProperty(2),
+                            UObjectPropertyData::StructProperty(vec![
+                                UObjectProperty { 
+                                    name: "TestMap".to_string(), 
+                                    arr_index: 0, 
+                                    data: UObjectPropertyData::MapProperty("StrProperty".to_string(), "IntProperty".to_string(), vec![
+                                        (UObjectPropertyData::StringProperty("Prop1".to_string()), UObjectPropertyData::IntProperty(5)),
+                                        (UObjectPropertyData::StringProperty("TestProp2".to_string()), UObjectPropertyData::IntProperty(7)),
+                                    ])
+                                }
+                            ])
+                        ),
+                        (
                             UObjectPropertyData::IntProperty(30),
                             UObjectPropertyData::StructProperty(vec![
                                 mkstr("SkipMapKeys")
                             ])
                         ),
+                        (
+                            UObjectPropertyData::IntProperty(2),
+                            UObjectPropertyData::StructProperty(vec![
+                                UObjectProperty { 
+                                    name: "TestMap".to_string(), 
+                                    arr_index: 0, 
+                                    data: UObjectPropertyData::MapProperty("StrProperty".to_string(), "StructProperty".to_string(), vec![
+                                        (UObjectPropertyData::StringProperty("Prop1".to_string()), UObjectPropertyData::StructProperty(vec![
+                                            mkstr("NestedStruct"),
+                                            mkfloat(77f32),
+                                        ])),
+                                        (UObjectPropertyData::StringProperty("TestProp2".to_string()), UObjectPropertyData::StructProperty(vec![
+                                            mkbyte(25,6),
+                                            mkstr("TestEndMapOnNestedStruct"),
+                                        ])),
+                                    ])
+                                }
+                            ])
+                        ),
                     ])
                 },
-                mkfloat(999f32),                
+                mkfloat(999f32),
+                mkstr("End of the object"),
             ]
         }
     }
@@ -797,6 +865,7 @@ mod test {
         let mut serialized_string = Cursor::new(vec![]);
         test.to_string(&mut serialized_string);
         serialized_string.set_position(0);
+        std::io::stdout().write_all(serialized_string.get_ref()).unwrap();
         match IoUObject::from_string(&mut serialized_string) {
             Ok(deserialized) => assert_equality(deserialized, get_test_object()),
             Err(err) => panic!("{:?}",err),
