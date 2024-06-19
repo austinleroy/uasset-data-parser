@@ -381,7 +381,7 @@ impl UObjectPropertyMetadata {
 
 #[derive(PartialEq, Debug)]
 pub enum UObjectPropertyData {
-    Array(UObjectPropertyHeader, String, Vec<UObjectPropertyData>),
+    Array(Vec<UObjectPropertyData>, Option<(UObjectPropertyHeader, String)>),
     Bool,
     Byte(u8),
     Enum(u64),
@@ -398,7 +398,7 @@ pub enum UObjectPropertyData {
 impl UObjectPropertyData {
     pub fn get_string_type(&self) -> &str {
         match self {
-            UObjectPropertyData::Array(_, _, _) => "ArrayProperty",
+            UObjectPropertyData::Array(_, _) => "ArrayProperty",
             UObjectPropertyData::Bool => "BoolProperty",
             UObjectPropertyData::Byte(_) => "ByteProperty",
             UObjectPropertyData::Enum(_) => "EnumProperty",
@@ -419,15 +419,25 @@ impl UObjectPropertyData {
                 let len = reader.read_u32::<E>().unwrap() as usize;
                 let mut items = Vec::with_capacity(len);
 
-                let item_schema = UObjectPropertyHeader::from_buffer::<R,E>(reader, name_map).expect("Array property missing item definition!");
-                let array_name = name_map[reader.read_u64::<E>().unwrap() as usize].clone();
-                let mut _additional_unknown_data = vec![0;17];
-                reader.read_exact(&mut _additional_unknown_data).unwrap();
+                let item_type = match metadata {
+                    UObjectPropertyMetadata::Array(v) => v,
+                    _ => panic!("ArrayProperty should always have Array metadata!")
+                };
+
+                let struct_meta = if item_type == &"StructProperty" {
+                    let item_schema = UObjectPropertyHeader::from_buffer::<R,E>(reader, name_map).expect("Array property missing item definition!");
+                    let array_name = name_map[reader.read_u64::<E>().unwrap() as usize].clone();
+                    let mut _additional_unknown_data = vec![0;17];
+                    reader.read_exact(&mut _additional_unknown_data).unwrap();
+                    Some((item_schema, array_name))
+                } else {
+                    None
+                };
+                
                 for _ in 0..len {
-                    //Unsure whether the type passed here should be taken from the item_schema or the array metadata... they both seem to match in current examples
-                    items.push(UObjectPropertyData::from_buffer::<_,E>(reader, &item_schema.r#type, metadata, name_map)?);
+                    items.push(UObjectPropertyData::from_buffer::<_,E>(reader, item_type, metadata, name_map)?);
                 }
-                Ok(UObjectPropertyData::Array(item_schema, array_name, items))
+                Ok(UObjectPropertyData::Array(items, struct_meta))
             },
             "BoolProperty" => {
                 Ok(UObjectPropertyData::Bool)
@@ -516,22 +526,31 @@ impl UObjectPropertyData {
 
     pub fn to_bytes<W: Write, E: byteorder::ByteOrder>(&self, writer: &mut W, name_map: &[String]) -> usize {
         match self {
-            Self::Array(item_schema, array_name, items) => {
-                writer.write_u32::<E>(items.len() as u32).unwrap(); // len = 4
+            Self::Array(items, struct_meta) => {
+                writer.write_u32::<E>(items.len() as u32).unwrap();
+                let mut written_len = 4;
 
                 let mut data = Cursor::new(vec![]);
                 for i in items {
                     i.to_bytes::<Cursor<Vec<u8>>,E>(&mut data, name_map);
                 }
                 let data = data.into_inner();
-                item_schema.to_bytes::<W,E>(writer, name_map, data.len()); // len += 24
-                let array_name_index = name_map.iter().position(|n| n == array_name).unwrap_or_else(|| panic!("Object type [{}] wasn't in name map", array_name)) as u64;
-                writer.write_u64::<E>(array_name_index).unwrap(); // len += 8
-                let additional_unknown_data = [0u8;17];
-                writer.write_all(&additional_unknown_data).unwrap(); // len += 17
+
+                if let Some((item_schema, array_name)) = struct_meta {
+                    item_schema.to_bytes::<W,E>(writer, name_map, data.len());
+                    written_len += UObjectPropertyHeader::byte_len();
+                    let array_name_index = name_map.iter().position(|n| n == array_name).unwrap_or_else(|| panic!("Object type [{}] wasn't in name map", array_name)) as u64;
+                    writer.write_u64::<E>(array_name_index).unwrap();
+                    written_len += 8;
+                    let additional_unknown_data = [0u8;17];
+                    writer.write_all(&additional_unknown_data).unwrap();
+                    written_len += 17;
+                }
+
                 writer.write_all(&data).unwrap(); // len += data.len()
+                written_len += data.len();
                 
-                4 + 24 + 8 + 17 + data.len()
+                written_len
             },
             Self::Bool => {
                 0 
@@ -610,7 +629,7 @@ impl UObjectPropertyData {
 
     pub fn to_string<W: Write>(&self, metadata: &UObjectPropertyMetadata, writer: &mut W, indent_spaces: usize) {
         match self {
-            Self::Array(header, array_name, items) => {
+            Self::Array(items, struct_meta) => {
                 let item_type = match metadata {
                     UObjectPropertyMetadata::Array(i) => i,
                     _ => panic!("Array property data must have array metadata")
@@ -618,10 +637,12 @@ impl UObjectPropertyData {
 
                 writer.write_all("!Array\n".as_bytes()).unwrap();
                 writer.write_all(format!("{}item_type: {item_type}\n", " ".repeat(indent_spaces + 2)).as_bytes()).unwrap();
-                writer.write_all(format!("{}item_schema:\n", " ".repeat(indent_spaces + 2)).as_bytes()).unwrap();
-                writer.write_all(format!("{}  name: {}\n", " ".repeat(indent_spaces + 2), header.name).as_bytes()).unwrap();
-                writer.write_all(format!("{}  type: {}\n", " ".repeat(indent_spaces + 2), header.r#type).as_bytes()).unwrap();
-                writer.write_all(format!("{}array_name: {array_name}\n", " ".repeat(indent_spaces + 2)).as_bytes()).unwrap();
+                if let Some((header, array_name)) = struct_meta {
+                    writer.write_all(format!("{}item_schema:\n", " ".repeat(indent_spaces + 2)).as_bytes()).unwrap();
+                    writer.write_all(format!("{}  name: {}\n", " ".repeat(indent_spaces + 2), header.name).as_bytes()).unwrap();
+                    writer.write_all(format!("{}  type: {}\n", " ".repeat(indent_spaces + 2), header.r#type).as_bytes()).unwrap();
+                    writer.write_all(format!("{}array_name: {array_name}\n", " ".repeat(indent_spaces + 2)).as_bytes()).unwrap();
+                }
 
                 writer.write_all(format!("{}items:\n", " ".repeat(indent_spaces + 2)).as_bytes()).unwrap();
                 for (i, item) in items.iter().enumerate() {
@@ -665,7 +686,7 @@ impl UObjectPropertyData {
                     writer.write_all("!EmptyString\n".as_bytes()).unwrap();
                 } else {
                     let val = val.replace('\n', "\\n");
-                    writer.write_all(format!("{val}\n").as_bytes()).unwrap();
+                    writer.write_all(format!("\"{val}\"\n").as_bytes()).unwrap();
                 }
             },
             Self::StringUtf16(val) => {
@@ -794,15 +815,21 @@ impl UObjectPropertyData {
             let mut array_name:  Option<String> = None;
             let mut items = vec![];
 
-            for _ in 0..4 {
+            let mut i = 0;
+            while i < 2 {
                 let next_line = next_nonempty_line(reader);
                 if !check_indent(&next_line, expected_indent_level + 2) {
-                    Err(format!("Array at 0x{start_position:x} should have properties (in order): item_type, item_schema, array_name, items"))?;
+                    Err(format!("Array at 0x{start_position:x} should have properties (in order): item_type, <item_schema?>, <array_name?>, items"))?;
                 }
 
                 let (key, val) = next_line.split_once(':').ok_or(format!("Array at 0x{:x} - expected [item_type:] property, but got:\n{}", start_position, next_line.trim()))?;
                 match key.trim() {
-                    "item_type" => { item_type = Some(val.trim().to_owned()); },
+                    "item_type" => { 
+                        item_type = Some(val.trim().to_owned());
+                        if val.trim() == "StructProperty" {
+                            i -= 2;
+                        }
+                    },
                     "item_schema" => { 
                         let mut name:   Option<String> = None;
                         let mut r#type: Option<String> = None;
@@ -853,6 +880,7 @@ impl UObjectPropertyData {
                     }
                     _ => { Err(format!("Array at 0x{:x} - expected item_type, item_schema, or items, but got {}", start_position, key.trim()))?; }
                 }
+                i += 1;
             }
 
             if items.is_empty() {
@@ -861,9 +889,8 @@ impl UObjectPropertyData {
 
             Ok((
                 UObjectPropertyData::Array(
-                    item_schema.ok_or(format!("Array at 0x{start_position:x} - missing item_schema!"))?,
-                    array_name.ok_or(format!("Array at 0x{start_position:x} - missing array_name!"))?,
-                    items.into_iter().map(|i| i.0).collect()
+                    items.into_iter().map(|i| i.0).collect(),
+                    item_schema.map(|s| (s, array_name.unwrap_or_else(|| panic!("Array at 0x{start_position:x} - missing array_name!")))),
                 ),
                 UObjectPropertyMetadata::Array(item_type.ok_or(format!("Array at 0x{start_position:x} - missing item_type!"))?)
             ))
@@ -899,7 +926,13 @@ impl UObjectPropertyData {
         } else if let Ok(val) = val.parse::<bool>() {
             Ok((UObjectPropertyData::Bool, UObjectPropertyMetadata::Bool(val)))
         } else {
-            Ok((UObjectPropertyData::String(val.replace("\\n", "\n")), UObjectPropertyMetadata::None))
+            let str: String = if val.starts_with("\"") {
+                if !val.ends_with("\"") { Err(format!("String value [{val}] doesn't have closing quote"))? }
+                val.chars().skip(1).take(val.len()-2).collect()
+            } else { 
+                val.chars().collect()
+            };
+            Ok((UObjectPropertyData::String(str.replace("\\n", "\n")), UObjectPropertyMetadata::None))
         }
     }
 }
@@ -1324,12 +1357,12 @@ mod test {
                         r#type: "ArrayProperty".to_string(),
                     },
                     metadata: UObjectPropertyMetadata::Array("IntProperty".to_string()),
-                    data: UObjectPropertyData::Array(UObjectPropertyHeader { name: "TestInt".to_string(), r#type: "IntProperty".to_string(), arr_index: 0}, "TestArray".to_string(), vec![
+                    data: UObjectPropertyData::Array(vec![
                         UObjectPropertyData::Int(7),
                         UObjectPropertyData::Int(293),
                         UObjectPropertyData::Int(353),
                         UObjectPropertyData::Int(80),
-                    ])
+                    ], None)
                 },
                 UObjectProperty {
                     header: UObjectPropertyHeader {
@@ -1338,11 +1371,11 @@ mod test {
                         r#type: "ArrayProperty".to_string()
                     },
                     metadata: UObjectPropertyMetadata::Array("StructProperty".to_string()),
-                    data: UObjectPropertyData::Array(UObjectPropertyHeader { name: "TestStruct".to_string(), r#type: "StructProperty".to_string(), arr_index: 0}, "TestArray".to_string(), vec![
+                    data: UObjectPropertyData::Array(vec![
                         UObjectPropertyData::Struct(vec![mkstr("Test struct 1"), mkint(7), mkbool(true)]),
                         UObjectPropertyData::Struct(vec![mkstr("Test struct 2"), mkint(9), mkbool(false), mkint(10), mkstr("Yes")]),
                         UObjectPropertyData::Struct(vec![mkstr("Test struct 3"), mkbool(true), mkstr("No"), mkint(11)]),
-                    ])
+                    ], Some((UObjectPropertyHeader { name: "TestStruct".to_string(), r#type: "StructProperty".to_string(), arr_index: 0}, "TestArray".to_string())))
                 },
             ]
         };
