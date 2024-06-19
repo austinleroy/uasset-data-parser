@@ -384,7 +384,7 @@ pub enum UObjectPropertyData {
     Array(Vec<UObjectPropertyData>, Option<(UObjectPropertyHeader, String)>),
     Bool,
     Byte(u8),
-    Enum(u64),
+    Enum(String),
     Struct(Vec<UObjectProperty>),
     Float(f32),
     String(String),
@@ -447,8 +447,7 @@ impl UObjectPropertyData {
                 Ok(UObjectPropertyData::Byte(val))
             },
             "EnumProperty" => {
-                let enum_val = reader.read_u64::<E>().unwrap();
-                Ok(UObjectPropertyData::Enum(enum_val))
+                Ok(UObjectPropertyData::Enum(name_map[reader.read_u64::<E>().unwrap() as usize].clone()))
             },
             "StructProperty" => {
                 let mut props = vec![];
@@ -560,8 +559,8 @@ impl UObjectPropertyData {
                 1
             },
             Self::Enum(enum_val) => {
-                writer.write_u64::<E>(*enum_val).unwrap();
-                0
+                writer.write_u64::<E>(name_map.iter().position(|n| n == enum_val).unwrap_or_else(|| panic!("Object type [{enum_val}] wasn't in name map")) as u64).unwrap();
+                8
             },
             Self::Struct(val) => {
                 let mut len = 0;
@@ -669,7 +668,8 @@ impl UObjectPropertyData {
                 writer.write_all(format!("!ByteProperty {enum_name:x} {metadata_val:x} {val:x}\n").as_bytes()).unwrap();
             },
             Self::Enum(enum_val) => {
-                writer.write_all(format!("!EnumProperty {enum_val:x}\n").as_bytes()).unwrap();
+                let sanitized = enum_val.replace("::", "->");
+                writer.write_all(format!("!EnumProperty {sanitized}\n").as_bytes()).unwrap();
             },
             Self::Struct(val) => {
                 writer.write_all("\n".as_bytes()).unwrap();
@@ -707,6 +707,7 @@ impl UObjectPropertyData {
 
                 for v in val {
                     let key_string = match &v.0 {
+                        Self::Enum(v) => v.replace("::", "->"),
                         Self::Int(v) => v.to_string(),
                         Self::UInt16(v) => v.to_string(),
                         Self::String(v) => v.clone(),
@@ -778,6 +779,7 @@ impl UObjectPropertyData {
                                 "StrProperty" => UObjectPropertyData::String(key.to_owned()),
                                 "FloatProperty" => UObjectPropertyData::Float(key.parse()?),
                                 "ByteProperty" => UObjectPropertyData::Byte(u8::from_str_radix(key, 16)?),
+                                "EnumProperty" => UObjectPropertyData::Enum(key.replace("->", "::")),
                                 other => Err(format!("Map at 0x{start_position:x} - unable to read data of key type '{other}'"))?,
                             };
                             let val = UObjectPropertyData::from_string::<R>(val, reader, expected_indent_level + 6)?;
@@ -914,8 +916,8 @@ impl UObjectPropertyData {
             
             Ok((UObjectPropertyData::Byte(u8::from_str_radix(byte_val, 16)?), UObjectPropertyMetadata::Byte(u64::from_str_radix(enum_id, 16)?, u8::from_str_radix(enum_val, 16)?)))
         } else if val.starts_with("!EnumProperty") {
-            let (_, enum_val) = val.split_once(' ').ok_or(format!("Error at 0x{:x}: !EnumProperty should have one hex parameter", reader.stream_position().unwrap()))?;
-            Ok((UObjectPropertyData::Enum(u64::from_str_radix(enum_val, 16)?), UObjectPropertyMetadata::None))
+            let (_, enum_val) = val.split_once(' ').ok_or(format!("Error at 0x{:x}: !EnumProperty should have one string parameter", reader.stream_position().unwrap()))?;
+            Ok((UObjectPropertyData::Enum(enum_val.replace("->", "::")), UObjectPropertyMetadata::None))
         } else if val.starts_with("!utf16") {
             let (_, utf16val) = val.split_once(' ').ok_or(format!("Error at 0x{:x}: !utf16 should have one string parameter", reader.stream_position().unwrap()))?;
             Ok((UObjectPropertyData::StringUtf16(utf16val.replace("\\n", "\n")), UObjectPropertyMetadata::None))
