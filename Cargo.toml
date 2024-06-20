@@ -8,3 +8,6 @@ edition = "2021"
 [dependencies]
 byteorder = "1"
 base64 = "0.22"
+
+[dev-dependencies]
+test_each_file = "0.3.2"

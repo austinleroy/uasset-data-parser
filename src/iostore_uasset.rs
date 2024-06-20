@@ -945,7 +945,7 @@ impl UObjectPropertyData {
                         }
 
                         let val_type = item_type.as_ref().unwrap().as_str();
-                        for (item, meta) in &items {
+                        for (item, _meta) in &items {
                             let entry_type = item.get_string_type();
                             if entry_type != val_type {
                                 Err(format!("Array at 0x{start_position:x} - expected item type '{val_type}', but got '{entry_type}'"))?;
@@ -957,9 +957,9 @@ impl UObjectPropertyData {
                 i += 1;
             }
 
-            // if items.is_empty() {
-            //     Err(format!("Array at 0x{start_position:x} - missing items!"))?;
-            // }
+            if items.is_empty() {
+                println!("Info: Array at 0x{start_position:x} - missing items!");
+            }
 
             Ok((
                 UObjectPropertyData::Array(
