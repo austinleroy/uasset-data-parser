@@ -278,6 +278,7 @@ pub enum UObjectPropertyMetadata {
     Byte(u64,u8),
     Enum(String),
     Map(String, String),
+    Struct(Vec<u8>),
     None,
 }
 
@@ -314,6 +315,11 @@ impl UObjectPropertyMetadata {
                 let _unknown_byte = reader.read_u8().unwrap();
                 UObjectPropertyMetadata::None
             },
+            "StructProperty" => {
+                let mut data = vec![0;25];
+                let _unknown_byte = reader.read_exact(&mut data).unwrap();
+                UObjectPropertyMetadata::Struct(data)
+            },
             "MapProperty" => {
                 let key_type = reader.read_u64::<E>().unwrap() as usize;
                 let key_type = &name_map[key_type];
@@ -325,6 +331,10 @@ impl UObjectPropertyMetadata {
                 let _unknown_value = reader.read_u32::<E>().unwrap() as usize;
 
                 UObjectPropertyMetadata::Map(key_type.clone(), value_type.clone())
+            },
+            "NameProperty" => {
+                let _unknown_byte = reader.read_u8().unwrap();
+                UObjectPropertyMetadata::None
             },
             "UInt16Property" => {
                 let _unknown_byte = reader.read_u8().unwrap();
@@ -382,6 +392,10 @@ impl UObjectPropertyMetadata {
                 writer.write_u32::<E>(0).unwrap();   // Unknown value - seems to be 0?
                 8 + 8 + 1 + 4
             },
+            Self::Struct(data) => {
+                writer.write_all(data).unwrap();
+                data.len()
+            },
             Self::None => {
                 writer.write_u8(0).unwrap();  // Unknown value - seems to be 0?
                 1
@@ -401,6 +415,7 @@ pub enum UObjectPropertyData {
     String(String),
     StringUtf16(String),
     Map(Vec<(UObjectPropertyData, UObjectPropertyData)>),
+    Name(String),
     UInt16(u16),
     UInt32(u32),
     Int(i32),
@@ -418,6 +433,7 @@ impl UObjectPropertyData {
             UObjectPropertyData::String(_) => "StrProperty",
             UObjectPropertyData::StringUtf16(_) => "StrProperty",
             UObjectPropertyData::Map(_) => "MapProperty",
+            UObjectPropertyData::Name(_) => "NameProperty",
             UObjectPropertyData::UInt16(_) => "UInt16Property",
             UObjectPropertyData::UInt32(_) => "UInt32Property",
             UObjectPropertyData::Int(_) => "IntProperty",
@@ -510,6 +526,9 @@ impl UObjectPropertyData {
                 }
 
                 Ok(UObjectPropertyData::Map(sets))
+            },
+            "NameProperty" => {
+                Ok(UObjectPropertyData::Name(name_map[reader.read_u64::<E>().unwrap() as usize].clone()))
             },
             "UInt16Property" => {
                 Ok(UObjectPropertyData::UInt16(reader.read_u16::<E>().unwrap()))
@@ -622,6 +641,10 @@ impl UObjectPropertyData {
 
                 size
             },
+            Self::Name(val) => {
+                writer.write_u64::<E>(name_map.iter().position(|n| n == val).unwrap_or_else(|| panic!("Object type [{val}] wasn't in name map")) as u64).unwrap();
+                8
+            }
             Self::UInt16(val) => {
                 writer.write_u16::<E>(*val).unwrap();
                 2
@@ -688,6 +711,9 @@ impl UObjectPropertyData {
                 writer.write_all(format!("!EnumProperty {enum_name} {sanitized_val}\n").as_bytes()).unwrap();
             },
             Self::Struct(val) => {
+                if let UObjectPropertyMetadata::Struct(data) = metadata {
+                    writer.write_all(format!("!struct {}", BASE64_STANDARD.encode(data)).as_bytes()).unwrap();
+                }
                 writer.write_all("\n".as_bytes()).unwrap();
                 for v in val {
                     writer.write_all(&" ".repeat(indent_spaces + 2).as_bytes()).unwrap();
@@ -735,6 +761,9 @@ impl UObjectPropertyData {
                     v.1.to_string::<W>(metadata,writer, indent_spaces + 6);
                 }
             },
+            Self::Name(val) => {
+                writer.write_all(format!("!name {val}\n").as_bytes()).unwrap();
+            },
             Self::UInt16(val) => {
                 writer.write_all(format!("!u16 {val}\n").as_bytes()).unwrap();
             },
@@ -749,12 +778,20 @@ impl UObjectPropertyData {
 
     pub fn from_string<R: BufRead + Seek>(val: &str, reader: &mut R, expected_indent_level: usize) -> Result<(Self, UObjectPropertyMetadata), Box<dyn Error>> {
         let val = val.trim();
-        if val.is_empty() { // Struct start
+        if val.is_empty() || val.starts_with("!struct") { // Struct start
+            let meta = if val.is_empty() {
+                UObjectPropertyMetadata::None
+            } else {
+                let (_, b64) = val.split_once(' ').ok_or(format!("Error at 0x{:x}: !struct should have one base64 parameter", reader.stream_position().unwrap()))?;
+                let data = BASE64_STANDARD.decode(b64).map_err(|_| format!("Unable to read !struct metadata from base64 string. This value shouldn't be manually edited."))?;
+                UObjectPropertyMetadata::Struct(data)
+            };
+
             let mut props = vec![];
             while let Some(prop) = UObjectProperty::from_string::<R>(reader, expected_indent_level + 2)? {
                 props.push(prop);
             }
-            Ok((UObjectPropertyData::Struct(props), UObjectPropertyMetadata::None))
+            Ok((UObjectPropertyData::Struct(props), meta))
         } else if val.starts_with("!Map") {
             let start_position = reader.stream_position().unwrap();
             let mut key_type:   Option<String> = None;
@@ -945,6 +982,9 @@ impl UObjectPropertyData {
             Ok((UObjectPropertyData::StringUtf16(utf16val.replace("\\n", "\n")), UObjectPropertyMetadata::None))
         } else if val.starts_with("!EmptyString") {
             Ok((UObjectPropertyData::String(String::new()), UObjectPropertyMetadata::None))
+        } else if val.starts_with("!name") {
+            let (_, name) = val.split_once(' ').ok_or(format!("Error at 0x{:x}: !name should have one string parameter", reader.stream_position().unwrap()))?;
+            Ok((UObjectPropertyData::Name(name.to_owned()), UObjectPropertyMetadata::None))
         } else if let Ok(val) = val.parse::<f32>() {
             Ok((UObjectPropertyData::Float(val), UObjectPropertyMetadata::None))
         } else if let Ok(val) = val.parse::<bool>() {
