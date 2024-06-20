@@ -149,7 +149,7 @@ pub struct UObjectPropertyHeader {
 }
 
 impl UObjectPropertyHeader {
-    pub fn from_buffer<R: Read + Seek, E: byteorder::ByteOrder>(reader: &mut R, name_map: &[String]) -> Option<Self> {
+    pub fn from_buffer<R: Read + Seek, E: byteorder::ByteOrder>(reader: &mut R, name_map: &[String]) -> Option<(Self, usize)> {
         let name_index = reader.read_u64::<E>().unwrap() as usize;
         let name = name_map[name_index].clone();
 
@@ -160,14 +160,14 @@ impl UObjectPropertyHeader {
         let type_index = reader.read_u64::<E>().unwrap() as usize;
         let r#type = name_map[type_index].clone();
 
-        let _size = reader.read_u32::<E>().unwrap() as usize;
+        let data_size = reader.read_u32::<E>().unwrap() as usize;
         let arr_index = reader.read_u32::<E>().unwrap() as usize;
 
-        Some(Self {
+        Some((Self {
             name,
             r#type,
             arr_index
-        })
+        }, data_size))
     }
 
     pub fn to_bytes<W: Write, E: byteorder::ByteOrder>(&self, writer: &mut W, name_map: &[String], data_size: usize) -> bool {
@@ -202,9 +202,9 @@ pub struct UObjectProperty {
 impl UObjectProperty {
     pub fn from_buffer<R: Read + Seek, E: byteorder::ByteOrder>(reader: &mut R, name_map: &[String]) -> Result<Option<Self>, Box<dyn Error>> {
         match UObjectPropertyHeader::from_buffer::<R,E>(reader, name_map) {
-            Some(header) => {
+            Some((header, expected_size)) => {
                 let metadata = UObjectPropertyMetadata::from_buffer::<R,E>(reader, &header.r#type, name_map);
-                let data = UObjectPropertyData::from_buffer::<R,E>(reader, &header.r#type, &metadata, name_map)?;
+                let data = UObjectPropertyData::from_buffer::<R,E>(reader, &header.r#type, &metadata, name_map, expected_size)?;
                 Ok(Some(Self {
                     header,
                     metadata,
@@ -410,7 +410,7 @@ pub enum UObjectPropertyData {
     Bool,
     Byte(u8),
     Enum(String),
-    Struct(Vec<UObjectProperty>),
+    Struct(Vec<UObjectProperty>, Vec<u8>),
     Float(f32),
     String(String),
     StringUtf16(String),
@@ -428,7 +428,7 @@ impl UObjectPropertyData {
             UObjectPropertyData::Bool => "BoolProperty",
             UObjectPropertyData::Byte(_) => "ByteProperty",
             UObjectPropertyData::Enum(_) => "EnumProperty",
-            UObjectPropertyData::Struct(_) => "StructProperty",
+            UObjectPropertyData::Struct(_,_) => "StructProperty",
             UObjectPropertyData::Float(_) => "FloatProperty",
             UObjectPropertyData::String(_) => "StrProperty",
             UObjectPropertyData::StringUtf16(_) => "StrProperty",
@@ -440,7 +440,7 @@ impl UObjectPropertyData {
         }
     }
 
-    pub fn from_buffer<R: Read + Seek, E: byteorder::ByteOrder>(reader: &mut R, r#type: &str, metadata: &UObjectPropertyMetadata, name_map: &[String]) -> Result<Self, Box<dyn Error>> {
+    pub fn from_buffer<R: Read + Seek, E: byteorder::ByteOrder>(reader: &mut R, r#type: &str, metadata: &UObjectPropertyMetadata, name_map: &[String], expected_size: usize) -> Result<Self, Box<dyn Error>> {
         match r#type {
             "ArrayProperty" => {
                 let len = reader.read_u32::<E>().unwrap() as usize;
@@ -456,13 +456,14 @@ impl UObjectPropertyData {
                     let array_name = name_map[reader.read_u64::<E>().unwrap() as usize].clone();
                     let mut _additional_unknown_data = vec![0;17];
                     reader.read_exact(&mut _additional_unknown_data).unwrap();
-                    Some((item_schema, array_name))
+                    assert!(vec![0;17].eq(&_additional_unknown_data), "Array of struct metadata wasn't empty!");
+                    Some((item_schema.0, array_name))
                 } else {
                     None
                 };
                 
                 for _ in 0..len {
-                    items.push(UObjectPropertyData::from_buffer::<_,E>(reader, item_type, metadata, name_map)?);
+                    items.push(UObjectPropertyData::from_buffer::<_,E>(reader, item_type, metadata, name_map, expected_size)?);
                 }
                 Ok(UObjectPropertyData::Array(items, struct_meta))
             },
@@ -477,11 +478,20 @@ impl UObjectPropertyData {
                 Ok(UObjectPropertyData::Enum(name_map[reader.read_u64::<E>().unwrap() as usize].clone()))
             },
             "StructProperty" => {
+                //HACK - dunno how to handle struct data that doesn't look like regular properties
+                let next_name = reader.read_u64::<E>().unwrap();
+                reader.seek(SeekFrom::Current(-8)).unwrap();
+                if next_name == 0 || next_name >= name_map.len() as u64 {
+                    let mut additional_data = vec![0;expected_size];
+                    reader.read_exact(&mut additional_data).unwrap();
+                    return Ok(UObjectPropertyData::Struct(vec![], additional_data));
+                }
+
                 let mut props = vec![];
                 while let Some(prop) = UObjectProperty::from_buffer::<R,E>(reader, name_map)? {
                     props.push(prop);
                 }
-                Ok(UObjectPropertyData::Struct(props))
+                Ok(UObjectPropertyData::Struct(props, vec![]))
             },
             "FloatProperty" => {
                 let val = reader.read_f32::<E>().unwrap();
@@ -520,8 +530,8 @@ impl UObjectPropertyData {
                 let arr_size = reader.read_u32::<E>().unwrap() as usize;
                 let mut sets = Vec::with_capacity(arr_size);
                 for _ in 0..arr_size {
-                    let next_key = UObjectPropertyData::from_buffer::<R,E>(reader, key_type, metadata, name_map)?;
-                    let next_value = UObjectPropertyData::from_buffer::<R,E>(reader, value_type, metadata, name_map)?;
+                    let next_key = UObjectPropertyData::from_buffer::<R,E>(reader, key_type, metadata, name_map, expected_size)?;
+                    let next_value = UObjectPropertyData::from_buffer::<R,E>(reader, value_type, metadata, name_map, expected_size)?;
                     sets.push((next_key, next_value));
                 }
 
@@ -541,14 +551,14 @@ impl UObjectPropertyData {
             }
             _ => {
                 //Err(format!("Unhandled property type: {}", r#type))?
-                eprintln!("Unhandled property type: {}", r#type);
+                eprintln!("WARNING: Unhandled property type: {}  # Expect errors.", r#type);
                 
                 let _unknown_byte = reader.read_u8().unwrap();
                 let mut props = vec![];
                 while let Some(prop) = UObjectProperty::from_buffer::<R,E>(reader, name_map)? {
                     props.push(prop);
                 }
-                Ok(UObjectPropertyData::Struct(props))
+                Ok(UObjectPropertyData::Struct(props, vec![]))
             }
         }
     }
@@ -592,14 +602,19 @@ impl UObjectPropertyData {
                 writer.write_u64::<E>(name_map.iter().position(|n| n == enum_val).unwrap_or_else(|| panic!("Object type [{enum_val}] wasn't in name map")) as u64).unwrap();
                 8
             },
-            Self::Struct(val) => {
+            Self::Struct(val, raw) => {
                 let mut len = 0;
-                for v in val {
-                    len += v.to_bytes::<W,E>(writer, name_map);
+                if val.len() > 0 {
+                    for v in val {
+                        len += v.to_bytes::<W,E>(writer, name_map);
+                    }
+                    let none_index = name_map.iter().position(|n| n == "None").unwrap_or_else(|| panic!("Object type [None] wasn't in name map")) as u64;
+                    writer.write_u64::<E>(none_index).unwrap();
+                    len += std::mem::size_of::<u64>();
+                } else {
+                    writer.write_all(raw).unwrap();
+                    len += raw.len();
                 }
-                let none_index = name_map.iter().position(|n| n == "None").unwrap_or_else(|| panic!("Object type [None] wasn't in name map")) as u64;
-                writer.write_u64::<E>(none_index).unwrap();
-                len += std::mem::size_of::<u64>();
                 len
             },
             Self::Float(val) => {
@@ -710,9 +725,9 @@ impl UObjectPropertyData {
                 let sanitized_val = enum_val.replace("::", "->");
                 writer.write_all(format!("!EnumProperty {enum_name} {sanitized_val}\n").as_bytes()).unwrap();
             },
-            Self::Struct(val) => {
+            Self::Struct(val, raw) => {
                 if let UObjectPropertyMetadata::Struct(data) = metadata {
-                    writer.write_all(format!("!struct {}", BASE64_STANDARD.encode(data)).as_bytes()).unwrap();
+                    writer.write_all(format!("!struct {} {}", BASE64_STANDARD.encode(data), BASE64_STANDARD.encode(raw)).as_bytes()).unwrap();
                 }
                 writer.write_all("\n".as_bytes()).unwrap();
                 for v in val {
@@ -779,19 +794,23 @@ impl UObjectPropertyData {
     pub fn from_string<R: BufRead + Seek>(val: &str, reader: &mut R, expected_indent_level: usize) -> Result<(Self, UObjectPropertyMetadata), Box<dyn Error>> {
         let val = val.trim();
         if val.is_empty() || val.starts_with("!struct") { // Struct start
-            let meta = if val.is_empty() {
-                UObjectPropertyMetadata::None
+            let (meta, raw) = if val.is_empty() {
+                (UObjectPropertyMetadata::None, vec![])
             } else {
-                let (_, b64) = val.split_once(' ').ok_or(format!("Error at 0x{:x}: !struct should have one base64 parameter", reader.stream_position().unwrap()))?;
-                let data = BASE64_STANDARD.decode(b64).map_err(|_| format!("Unable to read !struct metadata from base64 string. This value shouldn't be manually edited."))?;
-                UObjectPropertyMetadata::Struct(data)
+                let mut vals = val.split_whitespace();
+                vals.next().unwrap(); // !struct
+
+                let err = format!("Error at 0x{:x}: !struct should have one or two base64 parameters", reader.stream_position().unwrap());
+                let meta = BASE64_STANDARD.decode(vals.next().ok_or(err.clone())?).map_err(|_| format!("Unable to read !struct metadata from base64 string. This value shouldn't be manually edited."))?;
+                let raw = vals.next().map(|v| BASE64_STANDARD.decode(v).map_err(|_| format!("Unable to read !struct metadata from base64 string. This value shouldn't be manually edited."))).transpose()?.unwrap_or(vec![]);
+                (UObjectPropertyMetadata::Struct(meta), raw)
             };
 
             let mut props = vec![];
             while let Some(prop) = UObjectProperty::from_string::<R>(reader, expected_indent_level + 2)? {
                 props.push(prop);
             }
-            Ok((UObjectPropertyData::Struct(props), meta))
+            Ok((UObjectPropertyData::Struct(props, raw), meta))
         } else if val.starts_with("!Map") {
             let start_position = reader.stream_position().unwrap();
             let mut key_type:   Option<String> = None;
@@ -938,9 +957,9 @@ impl UObjectPropertyData {
                 i += 1;
             }
 
-            if items.is_empty() {
-                Err(format!("Array at 0x{start_position:x} - missing items!"))?;
-            }
+            // if items.is_empty() {
+            //     Err(format!("Array at 0x{start_position:x} - missing items!"))?;
+            // }
 
             Ok((
                 UObjectPropertyData::Array(
@@ -1247,7 +1266,7 @@ mod test {
                                 mkint(1),
                                 mkint(2),
                                 mkfloat(3f32),
-                            ])
+                            ], vec![])
                         ),
                         (
                             UObjectPropertyData::Int(1),
@@ -1256,7 +1275,7 @@ mod test {
                                 mkbool(false),
                                 mkbyte(7,7),
                                 mkstr("MoreTesting"),
-                            ])
+                            ], vec![])
                         ),
                         (
                             UObjectPropertyData::Int(2),
@@ -1273,13 +1292,13 @@ mod test {
                                         (UObjectPropertyData::String("TestProp2".to_string()), UObjectPropertyData::Int(7)),
                                     ])
                                 }
-                            ])
+                            ], vec![])
                         ),
                         (
                             UObjectPropertyData::Int(30),
                             UObjectPropertyData::Struct(vec![
                                 mkstr("SkipMapKeys")
-                            ])
+                            ], vec![])
                         ),
                         (
                             UObjectPropertyData::Int(2),
@@ -1295,14 +1314,14 @@ mod test {
                                         (UObjectPropertyData::String("Prop1".to_string()), UObjectPropertyData::Struct(vec![
                                             mkstr("NestedStruct"),
                                             mkfloat(77f32),
-                                        ])),
+                                        ], vec![])),
                                         (UObjectPropertyData::String("TestProp2".to_string()), UObjectPropertyData::Struct(vec![
                                             mkbyte(25,6),
                                             mkstr("TestEndMapOnNestedStruct"),
-                                        ])),
+                                        ], vec![])),
                                     ])
                                 }
-                            ])
+                            ], vec![])
                         ),
                     ])
                 },
@@ -1436,9 +1455,9 @@ mod test {
                     },
                     metadata: UObjectPropertyMetadata::Array("StructProperty".to_string()),
                     data: UObjectPropertyData::Array(vec![
-                        UObjectPropertyData::Struct(vec![mkstr("Test struct 1"), mkint(7), mkbool(true)]),
-                        UObjectPropertyData::Struct(vec![mkstr("Test struct 2"), mkint(9), mkbool(false), mkint(10), mkstr("Yes")]),
-                        UObjectPropertyData::Struct(vec![mkstr("Test struct 3"), mkbool(true), mkstr("No"), mkint(11)]),
+                        UObjectPropertyData::Struct(vec![mkstr("Test struct 1"), mkint(7), mkbool(true)], vec![]),
+                        UObjectPropertyData::Struct(vec![mkstr("Test struct 2"), mkint(9), mkbool(false), mkint(10), mkstr("Yes")], vec![]),
+                        UObjectPropertyData::Struct(vec![mkstr("Test struct 3"), mkbool(true), mkstr("No"), mkint(11)], vec![]),
                     ], Some((UObjectPropertyHeader { name: "TestStruct".to_string(), r#type: "StructProperty".to_string(), arr_index: 0}, "TestArray".to_string())))
                 },
             ]
