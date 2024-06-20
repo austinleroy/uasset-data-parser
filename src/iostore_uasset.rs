@@ -276,6 +276,7 @@ pub enum UObjectPropertyMetadata {
     Array(String),
     Bool(bool),
     Byte(u64,u8),
+    Enum(String),
     Map(String, String),
     None,
 }
@@ -299,6 +300,11 @@ impl UObjectPropertyMetadata {
                 let enum_name = reader.read_u64::<E>().unwrap();
                 let val = reader.read_u8().unwrap();
                 UObjectPropertyMetadata::Byte(enum_name, val)
+            },
+            "EnumProperty" => {
+                let enum_name = reader.read_u64::<E>().unwrap() as usize;
+                let _unknown_byte = reader.read_u8().unwrap();
+                UObjectPropertyMetadata::Enum(name_map[enum_name].clone())
             },
             "FloatProperty" => {
                 let _unknown_byte = reader.read_u8().unwrap();
@@ -359,6 +365,11 @@ impl UObjectPropertyMetadata {
             Self::Byte(enum_name, val, ) => {
                 writer.write_u64::<E>(*enum_name).unwrap();
                 writer.write_u8(*val).unwrap();
+                8 + 1
+            },
+            Self::Enum(enum_name) => {
+                writer.write_u64::<E>(name_map.iter().position(|n| n == enum_name).unwrap_or_else(|| panic!("Object type [{enum_name}] wasn't in name map")) as u64).unwrap();
+                writer.write_u8(0).unwrap();
                 8 + 1
             },
             Self::Map(key_type, val_type) => {
@@ -660,16 +671,21 @@ impl UObjectPropertyData {
                     writer.write_all("false\n".as_bytes()).unwrap();
                 }
             },
-            Self::Byte(val, ) => {
+            Self::Byte(val) => {
                 let (enum_name, metadata_val) = match metadata {
                     UObjectPropertyMetadata::Byte(e,m) => (e,m),
+                    UObjectPropertyMetadata::Array(_) => (&0, &0), // Bytes seem to be able to be in arrays without needing metadata
                     _ => panic!("Byte property data must have byte metadata")
                 };
                 writer.write_all(format!("!ByteProperty {enum_name:x} {metadata_val:x} {val:x}\n").as_bytes()).unwrap();
             },
             Self::Enum(enum_val) => {
-                let sanitized = enum_val.replace("::", "->");
-                writer.write_all(format!("!EnumProperty {sanitized}\n").as_bytes()).unwrap();
+                let enum_name = match metadata {
+                    UObjectPropertyMetadata::Enum(v) => v,
+                    _ => panic!("Enum property data must have enum metadata")
+                };
+                let sanitized_val = enum_val.replace("::", "->");
+                writer.write_all(format!("!EnumProperty {enum_name} {sanitized_val}\n").as_bytes()).unwrap();
             },
             Self::Struct(val) => {
                 writer.write_all("\n".as_bytes()).unwrap();
@@ -916,8 +932,14 @@ impl UObjectPropertyData {
             
             Ok((UObjectPropertyData::Byte(u8::from_str_radix(byte_val, 16)?), UObjectPropertyMetadata::Byte(u64::from_str_radix(enum_id, 16)?, u8::from_str_radix(enum_val, 16)?)))
         } else if val.starts_with("!EnumProperty") {
-            let (_, enum_val) = val.split_once(' ').ok_or(format!("Error at 0x{:x}: !EnumProperty should have one string parameter", reader.stream_position().unwrap()))?;
-            Ok((UObjectPropertyData::Enum(enum_val.replace("->", "::")), UObjectPropertyMetadata::None))
+            let mut vals = val.split_whitespace();
+            vals.next().unwrap(); // !EnumProperty
+
+            let err = format!("Error at 0x{:x}: !EnumProperty should have two string parameters", reader.stream_position().unwrap());
+            let enum_name = vals.next().ok_or(err.clone())?;
+            let enum_val = vals.next().ok_or(err.clone())?;
+            
+            Ok((UObjectPropertyData::Enum(enum_val.replace("->", "::")), UObjectPropertyMetadata::Enum(enum_name.to_owned())))
         } else if val.starts_with("!utf16") {
             let (_, utf16val) = val.split_once(' ').ok_or(format!("Error at 0x{:x}: !utf16 should have one string parameter", reader.stream_position().unwrap()))?;
             Ok((UObjectPropertyData::StringUtf16(utf16val.replace("\\n", "\n")), UObjectPropertyMetadata::None))
