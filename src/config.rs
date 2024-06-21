@@ -7,6 +7,7 @@ pub struct Config {
 pub enum Command {
     Encode,
     Decode,
+    Test,
 }
 
 impl Config {
@@ -16,6 +17,7 @@ impl Config {
         let command = match args.next().ok_or("Missing command")?.as_str() {
             "encode" => Command::Encode,
             "decode" => Command::Decode,
+            "test" => Command::Test,
             "--help" | "-h" => Err(String::new())?,
             other => Err(format!("Unknown command: {other}"))?
         };
@@ -36,10 +38,15 @@ impl Config {
 Converts a packed iouasset between binary and a yaml-like format. Built
 and tested using UE4.27 (no guarantees on other verions).
 
-Usage:     uasset-data-parser (decode|encode) <input path> [output path]
+Usage:     uasset-data-parser <command> <input path> [output path]
 
-    (decode|encode)   Command to execute.  Either decode a .uasset file or
-                      encode a .yaml_uasset file.
+    <command>         Command to execute.  
+    One of:
+        decode        Decodes a .uasset file.
+        encode        Encodes a .yaml_uasset file.
+        test          Decodes and reencodes a .uasset file, verifying that
+                      the final output matches the input.  Useful to ensure
+                      this tool will work with a given file.
 
     <input path>      Path to file that should be converted.
 

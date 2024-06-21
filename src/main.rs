@@ -1,6 +1,6 @@
 use byteorder::LE;
 use config::{Config, Command};
-use std::{fs::File, process, env, error::Error, io::BufReader};
+use std::{env, error::Error, fs::File, io::{BufReader, Cursor, Read}, process};
 
 mod iostore_uasset;
 mod config;
@@ -53,6 +53,35 @@ fn execute(config: Config) -> Result<(), Box<dyn Error>> {
             let object = IoUObject::from_buffer::<_, LE>(&mut BufReader::new(infile))?;
             object.to_string(&mut outfile);
         },
+        Command::Test => {
+            if !config.inpath.ends_with(".uasset") {
+                println!("WARNING: Testing a file that does not have the '.uasset' extension");
+            }
+
+            let mut infile = infile;
+            let mut original_file_bytes = {
+                let mut file_bytes = vec![];
+                infile.read_to_end(&mut file_bytes).unwrap();
+                Cursor::new(file_bytes)
+            };
+
+            let mut stringified = IoUObject::from_buffer::<_, LE>(&mut BufReader::new(&mut original_file_bytes)).map(|o| {
+                let mut s = Cursor::new(vec![]);
+                o.to_string(&mut s);            
+                s.set_position(0);
+                s
+            })?;
+            let result = IoUObject::from_string(&mut stringified).map(|r| {
+                let mut bytes = vec![];
+                r.to_bytes::<_,byteorder::LE>(&mut bytes);
+                bytes
+            })?;
+    
+            for (i, byte) in original_file_bytes.into_inner().iter().enumerate() {
+                assert_eq!(byte, &result[i], "File bytes differ at 0x{i:x}");
+            }
+            println!("SUCCESS: Decode/reencode resulted in same binary.")
+        }
     }
     Ok(())
 }
