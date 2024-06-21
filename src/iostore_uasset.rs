@@ -342,14 +342,6 @@ impl UObjectPropertyMetadata {
                 let _unknown_byte = reader.read_u8().unwrap();
                 UObjectPropertyMetadata::Enum(name_map[enum_name].clone())
             },
-            "FloatProperty" => {
-                let _unknown_byte = reader.read_u8().unwrap();
-                UObjectPropertyMetadata::None
-            },
-            "StrProperty" => {
-                let _unknown_byte = reader.read_u8().unwrap();
-                UObjectPropertyMetadata::None
-            },
             "StructProperty" => {
                 let mut data = vec![0;25];
                 let _unknown_byte = reader.read_exact(&mut data).unwrap();
@@ -367,23 +359,8 @@ impl UObjectPropertyMetadata {
 
                 UObjectPropertyMetadata::Map(key_type.clone(), value_type.clone())
             },
-            "NameProperty" => {
-                let _unknown_byte = reader.read_u8().unwrap();
-                UObjectPropertyMetadata::None
-            },
-            "UInt16Property" => {
-                let _unknown_byte = reader.read_u8().unwrap();
-                UObjectPropertyMetadata::None
-            },
-            "UInt32Property" => {
-                let _unknown_byte = reader.read_u8().unwrap();
-                UObjectPropertyMetadata::None
-            },
-            "IntProperty" => {
-                let _unknown_byte = reader.read_u8().unwrap();
-                UObjectPropertyMetadata::None
-            }
             _ => {
+                let _unknown_byte = reader.read_u8().unwrap();
                 UObjectPropertyMetadata::None
             }
         }
@@ -453,7 +430,9 @@ pub enum UObjectPropertyData {
     Name(String),
     UInt16(u16),
     UInt32(u32),
-    Int(i32),
+    Int8(i8),
+    Int16(i16),
+    Int32(i32),
 }
 
 impl UObjectPropertyData {
@@ -471,7 +450,9 @@ impl UObjectPropertyData {
             UObjectPropertyData::Name(_) => "NameProperty",
             UObjectPropertyData::UInt16(_) => "UInt16Property",
             UObjectPropertyData::UInt32(_) => "UInt32Property",
-            UObjectPropertyData::Int(_) => "IntProperty",
+            UObjectPropertyData::Int8(_) => "Int8Property",
+            UObjectPropertyData::Int16(_) => "Int16Property",
+            UObjectPropertyData::Int32(_) => "IntProperty",
         }
     }
 
@@ -581,9 +562,15 @@ impl UObjectPropertyData {
             "UInt32Property" => {
                 Ok(UObjectPropertyData::UInt32(reader.read_u32::<E>().unwrap()))
             },
+            "Int8Property" => {
+                Ok(UObjectPropertyData::Int8(reader.read_i8().unwrap()))
+            },
+            "Int16Property" => {
+                Ok(UObjectPropertyData::Int16(reader.read_i16::<E>().unwrap()))
+            },
             "IntProperty" => {
-                Ok(UObjectPropertyData::Int(reader.read_i32::<E>().unwrap()))
-            }
+                Ok(UObjectPropertyData::Int32(reader.read_i32::<E>().unwrap()))
+            },
             _ => {
                 //Err(format!("Unhandled property type: {}", r#type))?
                 eprintln!("WARNING: Unhandled property type: {}  # Expect errors.", r#type);
@@ -703,7 +690,15 @@ impl UObjectPropertyData {
                 writer.write_u32::<E>(*val).unwrap();
                 4
             },
-            Self::Int(val) => {
+            Self::Int8(val) => {
+                writer.write_i8(*val).unwrap();
+                1
+            },
+            Self::Int16(val) => {
+                writer.write_i16::<E>(*val).unwrap();
+                2
+            },
+            Self::Int32(val) => {
                 writer.write_i32::<E>(*val).unwrap();
                 4
             },
@@ -800,7 +795,7 @@ impl UObjectPropertyData {
                 for v in val {
                     let key_string = match &v.0 {
                         Self::Enum(v) => v.replace("::", "->"),
-                        Self::Int(v) => v.to_string(),
+                        Self::Int32(v) => v.to_string(),
                         Self::UInt16(v) => v.to_string(),
                         Self::String(v) => v.clone(),
                         Self::Float(v) => format!("{v:.}"),
@@ -820,7 +815,13 @@ impl UObjectPropertyData {
             Self::UInt32(val) => {
                 writer.write_all(format!("!u32 {val}\n").as_bytes()).unwrap();
             },
-            Self::Int(val) => {
+            Self::Int8(val) => {
+                writer.write_all(format!("!i8 {val}\n").as_bytes()).unwrap();
+            },
+            Self::Int16(val) => {
+                writer.write_all(format!("!i16 {val}\n").as_bytes()).unwrap();
+            },
+            Self::Int32(val) => {
                 writer.write_all(format!("!i32 {val}\n").as_bytes()).unwrap();
             },
         }
@@ -881,7 +882,7 @@ impl UObjectPropertyData {
                             let (key, val) = next_line.split_once('-').ok_or(format_err.clone())?.1.split_once(':').ok_or(format_err.clone())?;
                             let key = key.trim();
                             let key = match key_type.as_ref().unwrap().as_str() {
-                                "IntProperty" => UObjectPropertyData::Int(key.parse()?),
+                                "IntProperty" => UObjectPropertyData::Int32(key.parse()?),
                                 "UInt16Property" => UObjectPropertyData::UInt16(key.parse()?),
                                 "StrProperty" => UObjectPropertyData::String(key.to_owned()),
                                 "FloatProperty" => UObjectPropertyData::Float(key.parse()?),
@@ -1009,9 +1010,15 @@ impl UObjectPropertyData {
         } else if val.starts_with("!u32") {
             let (_, u32value) = val.split_once(' ').ok_or(format!("Error at 0x{:x}: !u32 should have one integer parameter", reader.stream_position().unwrap()))?;
             Ok((UObjectPropertyData::UInt32(u32value.parse::<u32>()?), UObjectPropertyMetadata::None))
+        } else if val.starts_with("!i8") {
+            let (_, i8value) = val.split_once(' ').ok_or(format!("Error at 0x{:x}: !i8 should have one integer parameter", reader.stream_position().unwrap()))?;
+            Ok((UObjectPropertyData::Int8(i8value.parse::<i8>()?), UObjectPropertyMetadata::None))
+        } else if val.starts_with("!i16") {
+            let (_, i16value) = val.split_once(' ').ok_or(format!("Error at 0x{:x}: !i16 should have one integer parameter", reader.stream_position().unwrap()))?;
+            Ok((UObjectPropertyData::Int16(i16value.parse::<i16>()?), UObjectPropertyMetadata::None))
         } else if val.starts_with("!i32") {
             let (_, i32value) = val.split_once(' ').ok_or(format!("Error at 0x{:x}: !i32 should have one integer parameter", reader.stream_position().unwrap()))?;
-            Ok((UObjectPropertyData::Int(i32value.parse::<i32>()?), UObjectPropertyMetadata::None))
+            Ok((UObjectPropertyData::Int32(i32value.parse::<i32>()?), UObjectPropertyMetadata::None))
         } else if val.starts_with("!ByteProperty") {
             let mut vals = val.split_whitespace();
             vals.next().unwrap(); // !ByteProperty
@@ -1247,7 +1254,7 @@ mod test {
     }
 
     fn mkint(value: i32) -> UObjectProperty {
-        let data = UObjectPropertyData::Int(value);
+        let data = UObjectPropertyData::Int32(value);
         UObjectProperty {
             header: UObjectPropertyHeader {
                 name: "TestInt".to_string(),
@@ -1316,7 +1323,7 @@ mod test {
                     metadata: UObjectPropertyMetadata::Map("IntProperty".to_string(), "StructProperty".to_string()),
                     data: UObjectPropertyData::Map(vec![
                         (
-                            UObjectPropertyData::Int(0),
+                            UObjectPropertyData::Int32(0),
                             UObjectPropertyData::Struct(vec![
                                 mkint(0),
                                 mkint(1),
@@ -1325,7 +1332,7 @@ mod test {
                             ], vec![])
                         ),
                         (
-                            UObjectPropertyData::Int(1),
+                            UObjectPropertyData::Int32(1),
                             UObjectPropertyData::Struct(vec![
                                 mkbool(true),
                                 mkbool(false),
@@ -1334,7 +1341,7 @@ mod test {
                             ], vec![])
                         ),
                         (
-                            UObjectPropertyData::Int(2),
+                            UObjectPropertyData::Int32(2),
                             UObjectPropertyData::Struct(vec![
                                 UObjectProperty {
                                     header: UObjectPropertyHeader {
@@ -1344,20 +1351,20 @@ mod test {
                                     },
                                     metadata: UObjectPropertyMetadata::Map("StrProperty".to_string(), "IntProperty".to_string()),
                                     data: UObjectPropertyData::Map(vec![
-                                        (UObjectPropertyData::String("Prop1".to_string()), UObjectPropertyData::Int(5)),
-                                        (UObjectPropertyData::String("TestProp2".to_string()), UObjectPropertyData::Int(7)),
+                                        (UObjectPropertyData::String("Prop1".to_string()), UObjectPropertyData::Int32(5)),
+                                        (UObjectPropertyData::String("TestProp2".to_string()), UObjectPropertyData::Int32(7)),
                                     ])
                                 }
                             ], vec![])
                         ),
                         (
-                            UObjectPropertyData::Int(30),
+                            UObjectPropertyData::Int32(30),
                             UObjectPropertyData::Struct(vec![
                                 mkstr("SkipMapKeys")
                             ], vec![])
                         ),
                         (
-                            UObjectPropertyData::Int(2),
+                            UObjectPropertyData::Int32(2),
                             UObjectPropertyData::Struct(vec![
                                 UObjectProperty { 
                                     header: UObjectPropertyHeader {
@@ -1497,10 +1504,10 @@ mod test {
                     },
                     metadata: UObjectPropertyMetadata::Array("IntProperty".to_string()),
                     data: UObjectPropertyData::Array(vec![
-                        UObjectPropertyData::Int(7),
-                        UObjectPropertyData::Int(293),
-                        UObjectPropertyData::Int(353),
-                        UObjectPropertyData::Int(80),
+                        UObjectPropertyData::Int32(7),
+                        UObjectPropertyData::Int32(293),
+                        UObjectPropertyData::Int32(353),
+                        UObjectPropertyData::Int32(80),
                     ], None)
                 },
                 UObjectProperty {
