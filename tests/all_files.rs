@@ -6,7 +6,7 @@ mod test_files {
     use test_each_file::test_each_path;
     use uasset_data_parser::IoUObject;
 
-    test_each_path!{ for ["uasset"] in "./test_files" => test}
+    test_each_path!{ for ["uasset"] in "./test_files" => test }
     
     fn test(path: [&Path; 1]) {
         let mut original_file_bytes = {

@@ -76,28 +76,46 @@ impl UObjectSummaryHeader {
     }
 }
 
+enum StringType {
+    Utf8,
+    Utf16,
+}
+
 
 struct UObjectSummary {
     header: UObjectSummaryHeader,
     name_map: Vec<String>,
+    name_map_type: Vec<StringType>,
     remaining_bytes: Vec<u8>,
 }
 
 impl UObjectSummary {
     pub fn from_buffer<R: Read + Seek, E: byteorder::ByteOrder>(reader: &mut R) -> Result<Self, Box<dyn Error>> {
         let header = UObjectSummaryHeader::from_buffer::<R, E>(reader)?;
-        reader.read_u8().unwrap(); // Seems to always be an empty byte here
-
         let names_count = (header.name_map_hashes_size/(std::mem::size_of::<u64>() as i32)) - 1;
-        let mut name_map = Vec::with_capacity(names_count as usize);
+        let mut name_map: Vec<String> = Vec::with_capacity(names_count as usize);
+        let mut name_map_type: Vec<StringType> = Vec::with_capacity(names_count as usize);
         for _ in 0..names_count {
-            let len = reader.read_u8().unwrap() as usize;
-            let mut raw_string = vec![0;len];
-            reader.read_exact(&mut raw_string).unwrap();
-            if reader.read_u8().unwrap() != 0 {
-                Err(format!("Malformed FString at byte 0x{:x} - length or termination byte is incorrect", reader.stream_position().unwrap()))?;
+            let meta1 = reader.read_u8().unwrap();
+            let meta2 = reader.read_u8().unwrap();
+
+            let len = ((meta1 & 0x7f) as usize) * 256 + meta2 as usize;
+            if meta1 & 0x80 > 0 { //utf16 marker
+                if reader.stream_position().unwrap() % 2 > 0 { // for some reason utf16 names seem to only start at even positions
+                    reader.read_u8().unwrap();
+                }
+                let mut raw_string = Vec::<u16>::with_capacity(len);
+                for _ in 0..len {
+                    raw_string.push(reader.read_u16::<E>().unwrap());
+                }
+                name_map.push(String::from_utf16(&raw_string).unwrap());
+                name_map_type.push(StringType::Utf16);
+            } else {
+                let mut raw_string = vec![0;len];
+                reader.read_exact(&mut raw_string).unwrap();
+                name_map.push(String::from_utf8(raw_string).unwrap());
+                name_map_type.push(StringType::Utf8);
             }
-            name_map.push(String::from_utf8(raw_string).unwrap());
         }
 
         let pos = reader.stream_position().unwrap() as usize;
@@ -109,18 +127,35 @@ impl UObjectSummary {
         Ok(Self {
             header,
             name_map,
+            name_map_type,
             remaining_bytes: raw_bytes,
         })
     }
 
     pub fn to_bytes<E: byteorder::ByteOrder>(&self) -> Vec<u8> {
         let mut result = self.header.to_bytes::<E>();
-        result.push(0);
+        for i in 0..self.name_map.len() {
+            let name = &self.name_map[i];
+            match self.name_map_type[i] {
+                StringType::Utf16 => {
+                    let bytes: Vec<u16> = name.encode_utf16().collect();
+                    result.push((bytes.len() / 256) as u8 | 0x80);
+                    result.push((bytes.len() % 256) as u8);
 
-        for name in &self.name_map {
-            result.push(name.len() as u8);
-            result.write_all(name.as_bytes()).unwrap();
-            result.push(0);
+                    if result.len() % 2 > 0 {
+                        result.push(0);
+                    }
+
+                    for char in bytes {
+                        result.write_u16::<E>(char).unwrap();
+                    }
+                },
+                StringType::Utf8 => {
+                    result.push((name.len() / 256) as u8);
+                    result.push((name.len() % 256) as u8);
+                    result.write_all(name.as_bytes()).unwrap();
+                }
+            }
         }
         
         result.write_all(&self.remaining_bytes).unwrap();
@@ -1120,7 +1155,7 @@ mod test {
     use byteorder::LE;
     use std::io::{Cursor, Write};
 
-    use super::{IoUObject, UObjectProperty, UObjectPropertyData, UObjectPropertyHeader, UObjectPropertyMetadata, UObjectSummary, UObjectSummaryHeader};
+    use super::{IoUObject, StringType, UObjectProperty, UObjectPropertyData, UObjectPropertyHeader, UObjectPropertyMetadata, UObjectSummary, UObjectSummaryHeader};
 
     fn get_test_object_summary() -> UObjectSummary {
         let summary_header = UObjectSummaryHeader {
@@ -1131,7 +1166,7 @@ mod test {
             name_map_names_offset: 0x40,
             name_map_names_size: 0x10,
             name_map_hashes_offset: 0x50,
-            name_map_hashes_size: 0x90,
+            name_map_hashes_size: 0x98,
             import_map_offset: 0x130,
             export_bundles_offset: 0x140,
             export_map_offset: 0x150,
@@ -1159,8 +1194,29 @@ mod test {
                 "TestString".to_string(),
                 "StructProperty".to_string(),
                 "TestStruct".to_string(),
+                "SomeUtf16Property".to_string(),
             ],
-            remaining_bytes: vec![0;36]
+            name_map_type: vec![
+                StringType::Utf8,
+                StringType::Utf8,
+                StringType::Utf8,
+                StringType::Utf8,
+                StringType::Utf8,
+                StringType::Utf8,
+                StringType::Utf8,
+                StringType::Utf8,
+                StringType::Utf8,
+                StringType::Utf8,
+                StringType::Utf8,
+                StringType::Utf8,
+                StringType::Utf8,
+                StringType::Utf8,
+                StringType::Utf8,
+                StringType::Utf8,
+                StringType::Utf8,
+                StringType::Utf16,
+            ],
+            remaining_bytes: vec![0;0]
         }
     }
 
