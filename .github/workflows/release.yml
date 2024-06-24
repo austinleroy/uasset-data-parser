@@ -37,7 +37,7 @@ jobs:
           tag: ${{ github.ref_name }}
         run: |
           cargo build --release --target x86_64-pc-windows-msvc
-          Compress-Archive target/x86_64-pc-windows-msvc/release/uasset-data-parser.exe release-${tag}-windows.zip
+          Compress-Archive target/x86_64-pc-windows-msvc/release/uasset-data-parser.exe ./artifacts/release-${tag}-windows.zip
       - name: Archive
         uses: actions/upload-artifact@v2
         with:
