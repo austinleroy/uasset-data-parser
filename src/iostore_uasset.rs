@@ -1,6 +1,6 @@
 use base64::{prelude::BASE64_STANDARD, Engine};
 use byteorder::{ReadBytesExt, WriteBytesExt, LE};
-use std::{error::Error, fmt::Display, io::{BufRead, Cursor, Read, Seek, SeekFrom, Write}};
+use std::{cmp::Ordering, error::Error, fmt::Display, io::{BufRead, Cursor, Read, Seek, SeekFrom, Write}};
 
 struct UObjectSummaryHeader {
     name: u64,     
@@ -344,7 +344,7 @@ impl UObjectPropertyMetadata {
             },
             "StructProperty" => {
                 let mut data = vec![0;25];
-                let _unknown_byte = reader.read_exact(&mut data).unwrap();
+                reader.read_exact(&mut data).unwrap();
                 UObjectPropertyMetadata::Struct(data)
             },
             "MapProperty" => {
@@ -467,7 +467,7 @@ impl UObjectPropertyData {
                     _ => panic!("ArrayProperty should always have Array metadata!")
                 };
 
-                let struct_meta = if item_type == &"StructProperty" {
+                let struct_meta = if item_type == "StructProperty" {
                     let item_schema = UObjectPropertyHeader::from_buffer::<R,E>(reader, name_map).expect("Array property missing item definition!");
                     let array_name = name_map[reader.read_u64::<E>().unwrap() as usize].clone();
                     let mut _additional_unknown_data = vec![0;17];
@@ -515,26 +515,31 @@ impl UObjectPropertyData {
             },
             "StrProperty" => {
                 let len = reader.read_i32::<E>().unwrap();
-                if len < 0 {
-                    let len = -len as usize;
-                    let mut raw_string = Vec::with_capacity(len-1);
-                    for _ in 0..len-1 {
-                        raw_string.push(reader.read_u16::<E>().unwrap());
+                match len.cmp(&0) {
+                    Ordering::Less => {
+                        let len = -len as usize;
+                        let mut raw_string = Vec::with_capacity(len-1);
+                        for _ in 0..len-1 {
+                            raw_string.push(reader.read_u16::<E>().unwrap());
+                        }
+                        if reader.read_u16::<E>().unwrap() != 0 {
+                            Err(format!("Malformed FString at byte 0x{:x} - length or termination byte is incorrect", reader.stream_position().unwrap()))?;
+                        }
+                        Ok(UObjectPropertyData::StringUtf16(String::from_utf16(&raw_string).unwrap()))
+                    },
+                    Ordering::Greater => {
+                        let len = len as usize;
+                        let mut raw_string = vec![0;len-1];
+                        reader.read_exact(&mut raw_string).unwrap();
+                        if reader.read_u8().unwrap() != 0 {
+                            Err(format!("Malformed FString at byte 0x{:x} - length or termination byte is incorrect", reader.stream_position().unwrap()))?;
+                        }
+                        Ok(UObjectPropertyData::String(String::from_utf8(raw_string).unwrap()))
+                    },
+                    Ordering::Equal => {
+                        Ok(UObjectPropertyData::String(String::new()))
+
                     }
-                    if reader.read_u16::<E>().unwrap() != 0 {
-                        Err(format!("Malformed FString at byte 0x{:x} - length or termination byte is incorrect", reader.stream_position().unwrap()))?;
-                    }
-                    Ok(UObjectPropertyData::StringUtf16(String::from_utf16(&raw_string).unwrap()))
-                } else if len > 0 {
-                    let len = len as usize;
-                    let mut raw_string = vec![0;len-1];
-                    reader.read_exact(&mut raw_string).unwrap();
-                    if reader.read_u8().unwrap() != 0 {
-                        Err(format!("Malformed FString at byte 0x{:x} - length or termination byte is incorrect", reader.stream_position().unwrap()))?;
-                    }
-                    Ok(UObjectPropertyData::String(String::from_utf8(raw_string).unwrap()))
-                } else { // empty string
-                    Ok(UObjectPropertyData::String(String::new()))
                 }
             },
             "MapProperty" => {
@@ -575,12 +580,9 @@ impl UObjectPropertyData {
                 //Err(format!("Unhandled property type: {}", r#type))?
                 eprintln!("WARNING: Unhandled property type: {}  # Expect errors.", r#type);
                 
-                let _unknown_byte = reader.read_u8().unwrap();
-                let mut props = vec![];
-                while let Some(prop) = UObjectProperty::from_buffer::<R,E>(reader, name_map)? {
-                    props.push(prop);
-                }
-                Ok(UObjectPropertyData::Struct(props, vec![]))
+                let mut additional_data = vec![0;expected_size];
+                reader.read_exact(&mut additional_data).unwrap();
+                Ok(UObjectPropertyData::Struct(vec![], additional_data))
             }
         }
     }
@@ -626,7 +628,7 @@ impl UObjectPropertyData {
             },
             Self::Struct(val, raw) => {
                 let mut len = 0;
-                if val.len() > 0 {
+                if !val.is_empty() {
                     for v in val {
                         len += v.to_bytes::<W,E>(writer, name_map);
                     }
@@ -761,7 +763,7 @@ impl UObjectPropertyData {
                 }
                 writer.write_all("\n".as_bytes()).unwrap();
                 for v in val {
-                    writer.write_all(&" ".repeat(indent_spaces + 2).as_bytes()).unwrap();
+                    writer.write_all(" ".repeat(indent_spaces + 2).as_bytes()).unwrap();
                     v.to_string::<W>(writer, indent_spaces + 2);
                 }
             },
@@ -837,8 +839,8 @@ impl UObjectPropertyData {
                 vals.next().unwrap(); // !struct
 
                 let err = format!("Error at 0x{:x}: !struct should have one or two base64 parameters", reader.stream_position().unwrap());
-                let meta = BASE64_STANDARD.decode(vals.next().ok_or(err.clone())?).map_err(|_| format!("Unable to read !struct metadata from base64 string. This value shouldn't be manually edited."))?;
-                let raw = vals.next().map(|v| BASE64_STANDARD.decode(v).map_err(|_| format!("Unable to read !struct metadata from base64 string. This value shouldn't be manually edited."))).transpose()?.unwrap_or(vec![]);
+                let meta = BASE64_STANDARD.decode(vals.next().ok_or(err.clone())?).map_err(|_| "Unable to read !struct metadata from base64 string. This value shouldn't be manually edited.".to_string())?;
+                let raw = vals.next().map(|v| BASE64_STANDARD.decode(v).map_err(|_| "Unable to read !struct metadata from base64 string. This value shouldn't be manually edited.".to_string())).transpose()?.unwrap_or(vec![]);
                 (UObjectPropertyMetadata::Struct(meta), raw)
             };
 
@@ -1051,8 +1053,8 @@ impl UObjectPropertyData {
         } else if let Ok(val) = val.parse::<bool>() {
             Ok((UObjectPropertyData::Bool, UObjectPropertyMetadata::Bool(val)))
         } else {
-            let str: String = if val.starts_with("\"") {
-                if !val.ends_with("\"") { Err(format!("String value [{val}] doesn't have closing quote"))? }
+            let str: String = if val.starts_with('\"') {
+                if !val.ends_with('\"') { Err(format!("String value [{val}] doesn't have closing quote"))? }
                 val.chars().skip(1).take(val.len()-2).collect()
             } else { 
                 val.chars().collect()
