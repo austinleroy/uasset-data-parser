@@ -17,6 +17,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Build Linux
+        env:
+          tag: ${{ github.ref_name }}
         run: |
           cargo build --release --target x86_64-unknown-linux-gnu
           tar -czf ./artifacts/release-${tag}-linux.tar.gz target/x86_64-unknown-linux-gnu/release/uasset-data-parser
@@ -30,9 +32,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Build Windows
+        env:
+          tag: ${{ github.ref_name }}
         run: |
           cargo build --release --target x86_64-pc-windows-msvc
-          zip release-${tag}-windows.zip target/x86_64-pc-windows-msvc-release-uasset-data-parser.exe
+          Compress-Archive target/x86_64-pc-windows-msvc-release-uasset-data-parser.exe release-${tag}-windows.zip
       - name: Archive
         uses: actions/upload-artifact@v2
         with:
