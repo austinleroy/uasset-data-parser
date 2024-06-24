@@ -22,6 +22,7 @@ jobs:
           tar -cf release-${tag}-linux.tar target/x86_64-unknown-linux-gnu/release/uasset-data-parser
       - name: Build Windows
         run: |
+          rustup target add x86_64-pc-windows-msvc
           cargo build --release --target x86_64-pc-windows-msvc
           zip release-${tag}-windows.zip target/x86_64-pc-windows-msvc-release-uasset-data-parser.exe
       - name: Create release
