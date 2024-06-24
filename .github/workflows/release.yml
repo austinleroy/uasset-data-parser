@@ -56,6 +56,8 @@ jobs:
         with:
           name: binary
           path: ./artifacts
+      - name: List Artifacts
+        run: ls artifacts
       - name: Create release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
